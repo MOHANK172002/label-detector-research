@@ -32,7 +32,7 @@ import os
 import time
 from skimage.metrics import structural_similarity as ssim_fn
 
-REGION_FILE = "region-technova.json"
+REGION_FILE = "region-test.json"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 IMG_SIZE         = (800, 600)
@@ -289,8 +289,17 @@ def main():
     print(f"Camera    : {args.camera}")
     print(f"\nSPACE = check    S = save    R = reset    ESC = quit\n")
 
+
+    url = (
+        "tcp://192.168.1.11:8888"
+        "?fflags=nobuffer"
+        "&flags=low_delay"
+        "&framedrop=1"
+    )
+
     # ── Open camera ────────────────────────────────────────────────────
-    cap = cv2.VideoCapture(args.camera)
+    # cap = cv2.VideoCapture(args.camera)
+    cap = cv2.VideoCapture(url)
     if not cap.isOpened():
         print(f"ERROR: cannot open camera {args.camera}")
         return

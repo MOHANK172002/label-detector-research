@@ -21,8 +21,8 @@ import json
 import argparse
 import os
 
-REGION_FILE = "region-technova.json"
-MASK_FILE   = "mask-technova.json"
+REGION_FILE = "region-test.json"
+MASK_FILE   = "mask-test.json"
 
 drawing  = False
 start_pt = (0, 0)
@@ -131,8 +131,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--camera", type=int, default=0)
     args = parser.parse_args()
-
-    cap = cv2.VideoCapture(args.camera)
+    
+    DEFAULT_URL = (
+    "tcp://192.168.1.11:8888"
+    "?fflags=nobuffer&flags=low_delay&framedrop=1"
+    )
+    
+    # cap = cv2.VideoCapture(args.camera)
+    cap = cv2.VideoCapture(DEFAULT_URL)
+    
     if not cap.isOpened():
         print(f"ERROR: cannot open camera {args.camera}")
         return
