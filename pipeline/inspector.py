@@ -48,10 +48,10 @@ GOOD_DIR    = os.path.join(BASE_DIR, "results", "good")
 BAD_DIR     = os.path.join(BASE_DIR, "results", "bad")
 
 # ── V-threshold detection ──────────────────────────────────────────────────────
-V_LOW      = 151
+V_LOW      = 175
 V_HIGH     = 255
-MORPH_K    = 9
-MIN_AREA_P = 3       # % of frame area
+MORPH_K    = 8
+MIN_AREA_P = 4       # % of frame area
 
 # ── Center zone trigger ────────────────────────────────────────────────────────
 CENTER_ZONE = 0.35   # fraction of half-frame; label center must be within this
@@ -62,12 +62,16 @@ AREA_TOL_PCT = 20.0  # ± % difference from master area to pass area check
 # ── SIFT / SSIM ────────────────────────────────────────────────────────────────
 IMG_SIZE        = (800, 600)
 SSIM_PASS       = 0.73
-FINE_FAIL_PCT   = 3.0
-COARSE_FAIL_PCT = 5.0
+FINE_FAIL_PCT   = 5.0
+COARSE_FAIL_PCT = 2.0
 FINE_BLUR       = 3
 COARSE_BLUR     = 31
 RATIO_TEST      = 0.75
 MIN_INLIERS     = 80
+
+# ── Auto-check toggle ─────────────────────────────────────────────────────────
+AUTO_CHECK = False    # True  = check automatically when tracker triggers
+                     # False = only check on C key press
 
 # ── Tracker ────────────────────────────────────────────────────────────────────
 IOU_SAME    = 0.35   # IoU above this → same label as previous
@@ -272,9 +276,10 @@ def detect_labels(frame):
     fh, fw = frame.shape[:2]
     v_ch   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 2]
     mask   = cv2.inRange(v_ch, V_LOW, V_HIGH)
-    k      = cv2.getStructuringElement(cv2.MORPH_RECT, (MORPH_K, MORPH_K))
-    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-    mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
+    if MORPH_K > 0:
+        k    = cv2.getStructuringElement(cv2.MORPH_RECT, (MORPH_K, MORPH_K))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
     flood_m = np.zeros((fh+2, fw+2), dtype=np.uint8)
     flooded = mask.copy()
     cv2.floodFill(flooded, flood_m, (0, 0), 255)
@@ -427,35 +432,36 @@ def sift_align(master_gray, test_gray, sift):
 
 
 def compute_scores(master_gray, aligned, mask_px):
+    """
+    Single-pass SSIM + pixel diff — matches sift_align_diff.py algorithm.
+    Pixels where SSIM map < 0.5 are counted as 'different'.
+    Hologram zone is zeroed out on both images before comparison.
+    Returns (ssim_score, diff_pct, diff_map, diff_mask).
+    """
     if aligned.shape != master_gray.shape:
         aligned = cv2.resize(aligned, (master_gray.shape[1], master_gray.shape[0]))
 
-    # Fine scale — blur first, then SSIM on full images (no zeroing before compare)
-    mf = cv2.GaussianBlur(master_gray, (FINE_BLUR, FINE_BLUR), 0)
-    af = cv2.GaussianBlur(aligned,     (FINE_BLUR, FINE_BLUR), 0)
-    score, diff_fine = ssim_fn(mf, af, full=True)
+    m = master_gray.copy()
+    a = aligned.copy()
 
-    # Zero out mask zone in the diff map AFTER computing (don't count those pixels)
-    diff_fine_masked = diff_fine.copy()
     if mask_px:
         x1 = max(0, mask_px["x"])
         y1 = max(0, mask_px["y"])
-        x2 = min(diff_fine.shape[1], mask_px["x"] + mask_px["w"])
-        y2 = min(diff_fine.shape[0], mask_px["y"] + mask_px["h"])
-        diff_fine_masked[y1:y2, x1:x2] = 1.0  # set to 1.0 = perfect match → ignored
+        x2 = min(m.shape[1], mask_px["x"] + mask_px["w"])
+        y2 = min(m.shape[0], mask_px["y"] + mask_px["h"])
+        m[y1:y2, x1:x2] = 0
+        a[y1:y2, x1:x2] = 0
 
-    fine_mask = diff_fine_masked < 0.5
-    fine_pct  = fine_mask.sum() / fine_mask.size * 100
+    score, diff_map = ssim_fn(m, a, full=True)
 
-    # Coarse scale — same approach
-    mc = cv2.GaussianBlur(master_gray, (COARSE_BLUR, COARSE_BLUR), 0)
-    ac = cv2.GaussianBlur(aligned,     (COARSE_BLUR, COARSE_BLUR), 0)
-    _, diff_coarse = ssim_fn(mc, ac, full=True)
+    diff_map_masked = diff_map.copy()
     if mask_px:
-        diff_coarse[y1:y2, x1:x2] = 1.0
-    coarse_pct = (diff_coarse < 0.5).sum() / diff_coarse.size * 100
+        diff_map_masked[y1:y2, x1:x2] = 1.0   # exclude mask zone from diff count
 
-    return score, fine_pct, coarse_pct, diff_fine, fine_mask
+    diff_mask = diff_map_masked < 0.5
+    diff_pct  = diff_mask.sum() / diff_mask.size * 100
+
+    return score, diff_pct, diff_map, diff_mask
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -463,9 +469,9 @@ def compute_scores(master_gray, aligned, mask_px):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def draw_4panel(master_gray, aligned, diff, diff_mask,
-                ssim_score, fine_pct, coarse_pct, inliers,
+                ssim_score, diff_pct, inliers,
                 area_ok, area_diff_pct,
-                verdict, ssim_ok, fine_ok, coarse_ok):
+                verdict, ssim_ok, diff_ok):
     color = (0,220,0) if verdict == "GOOD" else (0,0,220)
     h = master_gray.shape[0]
     p1 = cv2.cvtColor(master_gray, cv2.COLOR_GRAY2BGR)
@@ -474,7 +480,7 @@ def draw_4panel(master_gray, aligned, diff, diff_mask,
     cv2.putText(p2, "ALIGNED", (10,h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,200,255), 2)
     p3 = cv2.cvtColor(aligned, cv2.COLOR_GRAY2BGR)
     p3[diff_mask] = (0,0,220)
-    cv2.putText(p3, f"DIFF {fine_pct:.1f}%", (10,h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,220), 2)
+    cv2.putText(p3, f"DIFF {diff_pct:.1f}%", (10,h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,220), 2)
     p4 = cv2.applyColorMap((diff*255).astype(np.uint8), cv2.COLORMAP_JET)
     cv2.putText(p4, "HEATMAP", (10,h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
     ph = 260
@@ -484,17 +490,15 @@ def draw_4panel(master_gray, aligned, diff, diff_mask,
     grid = np.vstack([np.hstack([rs(p1), rs(p2)]),
                       np.hstack([rs(p3), rs(p4)])])
     bar = np.full((110, grid.shape[1], 3), 25, dtype=np.uint8)
-    sc = (0,220,0) if ssim_ok  else (0,0,220)
-    fc = (0,220,0) if fine_ok  else (0,0,220)
-    cc = (0,220,0) if coarse_ok else (0,0,220)
-    ac = (0,220,0) if area_ok  else (0,0,220)
-    cv2.putText(bar, f"Inliers:{inliers}",           ( 10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180,180,180), 1)
-    cv2.putText(bar, f"Area diff:{area_diff_pct:.1f}%",( 200,22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, ac, 1)
-    cv2.putText(bar, f"SSIM:{ssim_score:.3f}",       ( 10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7, sc, 2)
-    cv2.putText(bar, f"Fine:{fine_pct:.1f}%",        (220, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7, fc, 2)
-    cv2.putText(bar, f"Coarse:{coarse_pct:.1f}%",    (400, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7, cc, 2)
-    cv2.putText(bar, f">> {verdict}",                (600, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-    cv2.putText(bar, "M=setup  R=reset  Q=quit",     ( 10,100), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (140,140,140), 1)
+    sc = (0,220,0) if ssim_ok else (0,0,220)
+    dc = (0,220,0) if diff_ok else (0,0,220)
+    ac = (0,220,0) if area_ok else (0,0,220)
+    cv2.putText(bar, f"Inliers:{inliers}",              ( 10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180,180,180), 1)
+    cv2.putText(bar, f"Area diff:{area_diff_pct:.1f}%", (220, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, ac, 1)
+    cv2.putText(bar, f"SSIM:{ssim_score:.3f}",          ( 10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7, sc, 2)
+    cv2.putText(bar, f"Diff:{diff_pct:.1f}%",           (230, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7, dc, 2)
+    cv2.putText(bar, f">> {verdict}",                   (480, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+    cv2.putText(bar, "M=setup  C=check  R=reset  Q=quit",( 10,100), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (140,140,140), 1)
     return np.vstack([bar, grid])
 
 
@@ -557,7 +561,7 @@ def draw_live(frame, boxes, center_i, tracker_state,
         bc = (0,160,0) if last_verdict == "GOOD" else (0,0,160)
         cv2.rectangle(out, (0,fh-55), (fw,fh), bc, -1)
         area_str = f"  area_diff={last_area_diff:.1f}%" if last_area_diff is not None else ""
-        cv2.putText(out, f"LAST: {last_verdict}{area_str}   M=setup  R=reset  Q=quit",
+        cv2.putText(out, f"LAST: {last_verdict}{area_str}   M=setup  C=check  R=reset  Q=quit",
                     (10,fh-14), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2)
     else:
         if not master_loaded:
@@ -594,9 +598,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ref",    default=os.path.join(REF_DIR, "master.jpg"))
     parser.add_argument("--camera", type=int, default=None)
-    parser.add_argument("--ssim",   type=float, default=SSIM_PASS)
-    parser.add_argument("--diff",   type=float, default=FINE_FAIL_PCT)
-    parser.add_argument("--cdiff",  type=float, default=COARSE_FAIL_PCT)
+    parser.add_argument("--ssim",     type=float, default=SSIM_PASS,
+                        help=f"Min SSIM to pass (default {SSIM_PASS})")
+    parser.add_argument("--diff",     type=float, default=FINE_FAIL_PCT,
+                        help=f"Max diff %% to pass (default {FINE_FAIL_PCT})")
     parser.add_argument("--area-tol", type=float, default=AREA_TOL_PCT,
                         dest="area_tol")
     args = parser.parse_args()
@@ -664,7 +669,7 @@ def main():
     WIN_RESULT = "Result"
     cv2.namedWindow(WIN_LIVE,   cv2.WINDOW_NORMAL)
     cv2.namedWindow(WIN_RESULT, cv2.WINDOW_NORMAL)
-    print("M=setup  R=reset  Q=quit\n")
+    print("M=setup  C=check  R=reset  Q=quit\n")
 
     while True:
         ret, frame = cap.read()
@@ -684,7 +689,7 @@ def main():
         should_check = tracker.update(center_box)
 
         # ── Check this label ───────────────────────────────────────────
-        if should_check and master_loaded and center_box is not None:
+        if should_check and AUTO_CHECK and master_loaded and center_box is not None:
             bx, by, bw, bh = center_box
 
             # 1. Area check — compare to master
@@ -701,30 +706,27 @@ def main():
             if aligned is None or inliers < MIN_INLIERS:
                 print(f"  Low inliers ({inliers}) — realigning label")
             else:
-                # 4. SSIM — skip mask if area is outside tolerance (size mismatch)
                 active_mask = mask_px if area_ok else None
-                ssim_score, fine_pct, coarse_pct, diff_map, diff_mask = \
+                ssim_score, diff_pct, diff_map, diff_mask = \
                     compute_scores(master_gray, aligned, active_mask)
 
-                ssim_ok   = ssim_score >= args.ssim
-                fine_ok   = fine_pct   <  args.diff
-                coarse_ok = coarse_pct <  args.cdiff
-                verdict   = "GOOD" if (ssim_ok and fine_ok and coarse_ok and area_ok) \
-                            else "BAD"
+                ssim_ok = ssim_score >= args.ssim
+                diff_ok = diff_pct   <  args.diff
+                verdict = "GOOD" if (ssim_ok and diff_ok and area_ok) else "BAD"
 
                 last_verdict   = verdict
                 last_area_diff = area_diff
 
                 fname = save_result(crop, verdict)
                 print(f"  [{verdict}]  SSIM={ssim_score:.3f}  "
-                      f"Fine={fine_pct:.1f}%  Coarse={coarse_pct:.1f}%  "
-                      f"Area_diff={area_diff:.1f}%  Inliers={inliers}  → {fname}")
+                      f"Diff={diff_pct:.1f}%  Area_diff={area_diff:.1f}%  "
+                      f"Inliers={inliers}  → {fname}")
 
                 result_panel = draw_4panel(
                     master_gray, aligned, diff_map, diff_mask,
-                    ssim_score, fine_pct, coarse_pct, inliers,
+                    ssim_score, diff_pct, inliers,
                     area_ok, area_diff, verdict,
-                    ssim_ok, fine_ok, coarse_ok
+                    ssim_ok, diff_ok
                 )
 
         # ── Draw live feed ─────────────────────────────────────────────
@@ -750,6 +752,40 @@ def main():
             last_area_diff = None
             result_panel = None
             print("Reset.")
+
+        elif key in (ord('c'), ord('C')):
+            check_box = center_box if center_box is not None else tracker.last_box
+            if not master_loaded:
+                print("No master — press M to run setup first.")
+            elif check_box is None:
+                print("No label in view to check.")
+            else:
+                bx, by, bw, bh = check_box
+                area_ok, _, area_diff = area_check(bw, bh, master_area, args.area_tol)
+                crop      = frame[by:by+bh, bx:bx+bw]
+                test_gray = cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), IMG_SIZE)
+                aligned, inliers = sift_align(master_gray, test_gray, sift)
+                if aligned is None or inliers < MIN_INLIERS:
+                    print(f"  [C] Low inliers ({inliers}) — can't check.")
+                else:
+                    active_mask = mask_px if area_ok else None
+                    ssim_score, diff_pct, diff_map, diff_mask = \
+                        compute_scores(master_gray, aligned, active_mask)
+                    ssim_ok = ssim_score >= args.ssim
+                    diff_ok = diff_pct   <  args.diff
+                    verdict = "GOOD" if (ssim_ok and diff_ok and area_ok) else "BAD"
+                    last_verdict   = verdict
+                    last_area_diff = area_diff
+                    fname = save_result(crop, verdict)
+                    print(f"  [C/{verdict}]  SSIM={ssim_score:.3f}  "
+                          f"Diff={diff_pct:.1f}%  Area_diff={area_diff:.1f}%  "
+                          f"Inliers={inliers}  → {fname}")
+                    result_panel = draw_4panel(
+                        master_gray, aligned, diff_map, diff_mask,
+                        ssim_score, diff_pct, inliers,
+                        area_ok, area_diff, verdict,
+                        ssim_ok, diff_ok
+                    )
 
         elif key in (ord('m'), ord('M')):
             new_master, new_region, new_mask_rel = run_setup(cap)

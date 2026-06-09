@@ -13,7 +13,7 @@ Why this works:
 
 Usage:
     python3 sift_align_diff.py
-    python3 sift_align_diff.py --ref reference/good2.jpeg --labels labels
+    python3 sift_align_diff.py --ref reference/ref2.jpg --labels labels
     python3 sift_align_diff.py --ssim 0.75 --diff 8
     python3 sift_align_diff.py --ssim 0.73 --diff 6
 
