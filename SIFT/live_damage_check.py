@@ -1,30 +1,26 @@
 """
 SIFT Live Label Damage Checker
 ================================
-Same algorithm as sift_align_diff.py — SIFT align + single-scale SSIM pixel diff —
-runs on a live camera/stream with a fixed region and tracker.
+Automatically detects the label each frame using HSV sat-suppress (crop_tool.py
+algorithm), crops it, SIFT-aligns to a master reference, and scores with SSIM.
+
+No fixed region or manual box draw needed — the label is found automatically.
 
 Pipeline:
-  SETUP (press S — run once):
-    Draw a box around the label area in the camera view → saved to region.json
-    Then press M to capture the reference master from that region → master.jpg
-
-  INSPECTION (automatic):
-    1. Fixed region is cropped from every frame
-    2. LabelTracker detects when something stable enters the region
-    3. When stable (or press C):
-         a. Crop the region
-         b. SIFT align → master coordinate space
-         c. SSIM pixel diff (pixels where map < 0.5 = different)
-         d. GOOD if SSIM >= SSIM_PASS  AND  diff% < DIFF_AREA_FAIL
-    4. 4-panel result: Master | Aligned | Diff | Heatmap
-    5. Crop saved to SIFT/results/good/ or SIFT/results/bad/
+  1. Every frame: HSV sat-suppress finds the label bbox
+  2. LabelTracker checks the crop is stable across frames
+  3. When stable (or press C):
+       a. Crop the detected label
+       b. SIFT align → master coordinate space
+       c. SSIM pixel diff (pixels where map < 0.5 = different)
+       d. GOOD if SSIM >= SSIM_PASS  AND  diff% < DIFF_AREA_FAIL
+  4. 4-panel result: Master | Aligned | Diff | Heatmap
+  5. Crop saved to SIFT/results/good/ or SIFT/results/bad/
 
 Controls:
-  S       = setup region (draw box on live feed)
-  X       = draw mask zone to ignore in diff (e.g. hologram, barcode)
-  M       = capture current region crop as master reference
-  C       = manually check region right now
+  T       = toggle detector tuner window (live HSV/morph trackbars)
+  M       = capture current detected label crop as master reference
+  C       = manually trigger check right now
   R       = reset tracker + last result
   Q / ESC = quit
 
@@ -37,7 +33,6 @@ Usage:
 
 import cv2
 import numpy as np
-import json
 import os
 import time
 import argparse
@@ -50,202 +45,147 @@ DEFAULT_URL = (
 )
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
-REF_PATH     = os.path.join(BASE_DIR, "reference", "master.jpg")
-REGION_FILE  = os.path.join(BASE_DIR, "region-test.json")
-MASK_FILE    = os.path.join(BASE_DIR, "mask-test.json")
-GOOD_DIR     = os.path.join(BASE_DIR, "results", "good")
-BAD_DIR      = os.path.join(BASE_DIR, "results", "bad")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+REF_PATH = os.path.join(BASE_DIR, "reference", "master.jpg")
+GOOD_DIR = os.path.join(BASE_DIR, "results", "good")
+BAD_DIR  = os.path.join(BASE_DIR, "results", "bad")
 
-# ── SIFT / SSIM  (same defaults as sift_align_diff.py) ────────────────────────
+# ── SIFT / SSIM ────────────────────────────────────────────────────────────────
 IMG_SIZE       = (800, 600)
-SSIM_PASS      = 0.75       # SSIM >= this → pass
-DIFF_AREA_FAIL = 8.0        # diff% < this → pass
-RATIO_TEST     = 0.75       # Lowe's ratio test
-MIN_INLIERS    = 40         # min RANSAC inliers to accept alignment
+SSIM_PASS      = 0.75
+DIFF_AREA_FAIL = 8.0
+RATIO_TEST     = 0.75
+MIN_INLIERS    = 40
 
 # ── Tracker ────────────────────────────────────────────────────────────────────
-IOU_SAME       = 0.35
-IOU_NEW        = 0.10
 CHECK_COOLDOWN = 2.0        # seconds between auto-checks
+AUTO_CHECK     = True
 
-# ── Auto-check toggle ──────────────────────────────────────────────────────────
-AUTO_CHECK = True           # False = only check on C key press
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# REGION SETUP  (from setup_region.py — Step 1 only, no mask)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_drawing  = False
-_start_pt = (0, 0)
-_end_pt   = (0, 0)
-
-def _mouse_cb(event, x, y, flags, param):
-    global _drawing, _start_pt, _end_pt
-    if event == cv2.EVENT_LBUTTONDOWN:
-        _drawing  = True
-        _start_pt = _end_pt = (x, y)
-    elif event == cv2.EVENT_MOUSEMOVE and _drawing:
-        _end_pt = (x, y)
-    elif event == cv2.EVENT_LBUTTONUP:
-        _drawing = False
-        _end_pt  = (x, y)
-
-def _get_rect(p1, p2):
-    x = min(p1[0], p2[0])
-    y = min(p1[1], p2[1])
-    return x, y, abs(p2[0] - p1[0]), abs(p2[1] - p1[1])
-
-def run_region_setup(cap):
-    """
-    Draw a box on the live feed to define the label region.
-    Returns (x, y, w, h) on confirm, None on cancel.
-    Saves result to region.json.
-    """
-    global _start_pt, _end_pt
-    _start_pt = _end_pt = (0, 0)
-
-    WIN = "SETUP — Draw box around LABEL AREA  (ENTER=confirm  R=redraw  ESC=cancel)"
-    cv2.namedWindow(WIN)
-    cv2.setMouseCallback(WIN, _mouse_cb)
-    print("\n[Setup] Draw a box around the label area, then press ENTER.")
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        disp = frame.copy()
-        fh, fw = disp.shape[:2]
-
-        x, y, bw, bh = _get_rect(_start_pt, _end_pt)
-        if bw > 5 and bh > 5:
-            cv2.rectangle(disp, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
-            cv2.putText(disp, f"{bw}x{bh}  ({x},{y})",
-                        (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        cv2.putText(disp, "Drag box around LABEL AREA",
-                    (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(disp, "ENTER/SPACE = confirm    R = redraw    ESC = cancel",
-                    (10, fh - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-
-        cv2.imshow(WIN, disp)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key in (13, ord(' ')):
-            x, y, bw, bh = _get_rect(_start_pt, _end_pt)
-            if bw < 20 or bh < 20:
-                print("  Too small — draw again.")
-                continue
-            cv2.destroyWindow(WIN)
-            region = {"x": x, "y": y, "w": bw, "h": bh}
-            with open(REGION_FILE, "w") as f:
-                json.dump(region, f, indent=2)
-            print(f"[Setup] Region saved: x={x} y={y} w={bw} h={bh}  → {REGION_FILE}")
-            return region
-        elif key in (ord('r'), ord('R')):
-            _start_pt = _end_pt = (0, 0)
-        elif key == 27:
-            cv2.destroyWindow(WIN)
-            print("[Setup] Cancelled.")
-            return None
-
-    cv2.destroyWindow(WIN)
-    return None
-
-
-def run_mask_setup(cap, region):
-    """
-    Draw a box over the zone to IGNORE during diff (e.g. hologram, barcode).
-    Stored as relative fractions of the region so it scales with any region size.
-    Returns mask dict or None on cancel. Saves to mask-test.json.
-    """
-    global _start_pt, _end_pt
-    _start_pt = _end_pt = (0, 0)
-
-    rx, ry, rw, rh = region["x"], region["y"], region["w"], region["h"]
-    WIN = "SETUP — Draw MASK zone to IGNORE  (ENTER=confirm  R=redraw  ESC=cancel)"
-    cv2.namedWindow(WIN)
-    cv2.setMouseCallback(WIN, _mouse_cb)
-    print("\n[Mask] Draw a box over the zone to IGNORE, then press ENTER.")
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        disp = frame.copy()
-        fh, fw = disp.shape[:2]
-
-        # Always show region reference in green
-        cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), 2)
-        cv2.putText(disp, "Label region", (rx, ry - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-        # Current drawn mask box in orange
-        x, y, bw, bh = _get_rect(_start_pt, _end_pt)
-        if bw > 5 and bh > 5:
-            cv2.rectangle(disp, (x, y), (x + bw, y + bh), (0, 140, 255), 2)
-            cv2.putText(disp, f"MASK  {bw}x{bh}",
-                        (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
-
-        cv2.putText(disp, "Draw box over zone to IGNORE in diff",
-                    (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 140, 255), 2)
-        cv2.putText(disp, "ENTER/SPACE = confirm    R = redraw    ESC = cancel",
-                    (10, fh - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-
-        cv2.imshow(WIN, disp)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key in (13, ord(' ')):
-            x, y, bw, bh = _get_rect(_start_pt, _end_pt)
-            if bw < 10 or bh < 10:
-                print("  Too small — draw again.")
-                continue
-            cv2.destroyWindow(WIN)
-            # Store as relative offsets from region top-left, as fraction of region size
-            mask = {
-                "rx": (x - rx) / rw,
-                "ry": (y - ry) / rh,
-                "rw": bw / rw,
-                "rh": bh / rh,
-            }
-            with open(MASK_FILE, "w") as f:
-                json.dump(mask, f, indent=2)
-            print(f"[Mask] Saved: rx={mask['rx']:.3f} ry={mask['ry']:.3f} "
-                  f"rw={mask['rw']:.3f} rh={mask['rh']:.3f}  → {MASK_FILE}")
-            return mask
-        elif key in (ord('r'), ord('R')):
-            _start_pt = _end_pt = (0, 0)
-        elif key == 27:
-            cv2.destroyWindow(WIN)
-            print("[Mask] Cancelled.")
-            return None
-
-    cv2.destroyWindow(WIN)
-    return None
+# ── Label detector (from crop_tool.py) ────────────────────────────────────────
+AD_S_MAX        = 241   # max saturation to be considered a label pixel
+AD_V_MIN        = 107   # min brightness to be considered a label pixel
+AD_MORPH_K      = 7     # morphology kernel size (odd)
+AD_MIN_AREA_PCT = 4     # % of frame area — smaller blobs ignored
+AD_PADDING      = 6     # pixels of padding added around detected bbox
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TRACKER  (inspector.py algorithm — tracks stability inside the region)
+# DETECTOR TUNER  (live trackbar window — press T to open/close)
+# ══════════════════════════════════════════════════════════════════════════════
+
+WIN_TUNER = "Detector Tuner  (T=close)"
+
+def _nothing(_):
+    pass
+
+def open_tuner():
+    cv2.namedWindow(WIN_TUNER, cv2.WINDOW_NORMAL)
+    cv2.createTrackbar("S max",     WIN_TUNER, AD_S_MAX,        255, _nothing)
+    cv2.createTrackbar("V min",     WIN_TUNER, AD_V_MIN,        255, _nothing)
+    cv2.createTrackbar("Morph k",   WIN_TUNER, AD_MORPH_K,       31, _nothing)
+    cv2.createTrackbar("Min area%", WIN_TUNER, AD_MIN_AREA_PCT,  50, _nothing)
+    cv2.createTrackbar("Padding",   WIN_TUNER, AD_PADDING,       40, _nothing)
+
+def close_tuner():
+    try:
+        cv2.destroyWindow(WIN_TUNER)
+    except Exception:
+        pass
+
+def read_tuner():
+    """Read current trackbar values. Returns a params dict."""
+    k = cv2.getTrackbarPos("Morph k", WIN_TUNER)
+    k = max(k + (0 if k % 2 == 1 else 1), 1)   # force odd, min 1
+    return {
+        "s_max":    cv2.getTrackbarPos("S max",     WIN_TUNER),
+        "v_min":    cv2.getTrackbarPos("V min",     WIN_TUNER),
+        "morph_k":  k,
+        "min_area": cv2.getTrackbarPos("Min area%", WIN_TUNER),
+        "padding":  cv2.getTrackbarPos("Padding",   WIN_TUNER),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LABEL DETECTOR  (HSV sat-suppress — crop_tool.py algorithm)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_label(frame, params=None):
+    """
+    Detect the label rectangle in a bottom-lit cyan scene.
+    params: dict from read_tuner(), or None to use module-level defaults.
+    Returns {x, y, w, h} of the blob closest to the frame centre, or None.
+    Also returns the binary mask (for tuner preview).
+    """
+    s_max    = params["s_max"]    if params else AD_S_MAX
+    v_min    = params["v_min"]    if params else AD_V_MIN
+    morph_k  = params["morph_k"]  if params else AD_MORPH_K
+    min_area_pct = params["min_area"] if params else AD_MIN_AREA_PCT
+    padding  = params["padding"]  if params else AD_PADDING
+
+    fh, fw = frame.shape[:2]
+    hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    s_ch = hsv[:, :, 1]
+    v_ch = hsv[:, :, 2]
+
+    low_sat    = cv2.inRange(s_ch, 0,     s_max)
+    bright     = cv2.inRange(v_ch, v_min, 255)
+    label_mask = cv2.bitwise_and(low_sat, bright)
+    label_mask = cv2.bitwise_not(label_mask)
+
+    k_size  = max(morph_k, 1)
+    k_small = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
+    closed  = cv2.morphologyEx(label_mask, cv2.MORPH_CLOSE, k_small)
+
+    big = max(k_size * 3 + 1, 11)
+    if big % 2 == 0:
+        big += 1
+    k_big = cv2.getStructuringElement(cv2.MORPH_RECT, (big, big))
+    solid = cv2.morphologyEx(closed, cv2.MORPH_OPEN, k_big)
+
+    cnts, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    min_area = (min_area_pct / 100.0) * fh * fw
+    cx_f, cy_f = fw // 2, fh // 2
+    best_box  = None
+    best_dist = float("inf")
+
+    for cnt in cnts:
+        if cv2.contourArea(cnt) < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w > fw * 0.95 or h > fh * 0.95:
+            continue
+        if w < h * 0.3:
+            continue
+        dist = ((x + w // 2 - cx_f) ** 2 + (y + h // 2 - cy_f) ** 2) ** 0.5
+        if dist < best_dist:
+            best_dist = dist
+            best_box  = (x, y, w, h)
+
+    if best_box is None:
+        return None, solid
+
+    x, y, w, h = best_box
+    x = max(0, x - padding)
+    y = max(0, y - padding)
+    w = min(fw - x, w + padding * 2)
+    h = min(fh - y, h + padding * 2)
+    return {"x": x, "y": y, "w": w, "h": h}, solid
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRACKER
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LabelTracker:
-    """
-    Detects when the region content is stable across frames.
-    Compares mean brightness of successive crops using a simple diff threshold.
-    WAITING → STABLE → CHECKED → WAITING
-    """
+    """Detects when the region crop is stable across frames."""
     def __init__(self):
-        self.state      = "WAITING"
-        self.last_mean  = None
-        self.last_check = 0.0
+        self.state        = "WAITING"
+        self.last_mean    = None
+        self.last_check   = 0.0
         self.stable_since = 0.0
 
     def update(self, crop):
-        """
-        Pass the current region crop each frame.
-        Returns True when the content is stable and ready to check.
-        """
         now  = time.time()
         mean = float(crop.mean())
 
@@ -259,38 +199,33 @@ class LabelTracker:
         self.last_mean = mean
 
         if diff > 2.0:
-            # Content changed — reset stability timer
             self.stable_since = now
             self.state        = "WAITING"
             return False
 
-        # Content is stable
-        stable_secs = now - self.stable_since
-        if stable_secs < 0.5:
+        if (now - self.stable_since) < 0.5:
             self.state = "WAITING"
             return False
 
         self.state = "STABLE"
-
         if (now - self.last_check) > CHECK_COOLDOWN:
             self.state      = "CHECKED"
             self.last_check = now
             return True
-
         return False
 
     def get_state(self):
         return self.state
 
     def reset(self):
-        self.state      = "WAITING"
-        self.last_mean  = None
-        self.last_check = 0.0
+        self.state        = "WAITING"
+        self.last_mean    = None
+        self.last_check   = 0.0
         self.stable_since = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIFT ALIGN  (sift_align_diff.py — unchanged)
+# SIFT ALIGN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def sift_align(master_gray, test_gray, sift):
@@ -317,62 +252,30 @@ def sift_align(master_gray, test_gray, sift):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MASK HELPERS
+# SCORING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def mask_to_pixels(mask_rel):
-    """Convert relative mask offsets to pixel coords on the IMG_SIZE canvas."""
-    if mask_rel is None:
-        return None
-    return {
-        "x": max(0, int(mask_rel["rx"] * IMG_SIZE[0])),
-        "y": max(0, int(mask_rel["ry"] * IMG_SIZE[1])),
-        "w": max(1, int(mask_rel["rw"] * IMG_SIZE[0])),
-        "h": max(1, int(mask_rel["rh"] * IMG_SIZE[1])),
-    }
-
-
-def apply_mask_to_pair(img_a, img_b, mask_px):
-    """Zero out the mask zone on both IMG_SIZE grayscale images in-place copies."""
-    if mask_px is None:
-        return img_a, img_b
-    a = img_a.copy()
-    b = img_b.copy()
-    x1 = mask_px["x"]
-    y1 = mask_px["y"]
-    x2 = min(a.shape[1], x1 + mask_px["w"])
-    y2 = min(a.shape[0], y1 + mask_px["h"])
-    a[y1:y2, x1:x2] = 0
-    b[y1:y2, x1:x2] = 0
-    return a, b
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SCORING  (sift_align_diff.py algorithm + optional mask)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def compute_scores(master_gray, aligned, mask_px=None):
-    """
-    SSIM pixel diff — pixels where SSIM map < 0.5 counted as different.
-    mask_px zone is zeroed on both images before comparison and excluded
-    from the diff% count.
-    """
+def compute_scores(master_gray, aligned):
     if aligned.shape != master_gray.shape:
         aligned = cv2.resize(aligned, (master_gray.shape[1], master_gray.shape[0]))
-
-    m, a = apply_mask_to_pair(master_gray, aligned, mask_px)
-    ssim_score, diff = ssim_fn(m, a, full=True)
-
-    # Exclude mask zone from diff count by setting it to 1.0 (no difference)
-    if mask_px is not None:
-        x1, y1 = mask_px["x"], mask_px["y"]
-        x2 = min(diff.shape[1], x1 + mask_px["w"])
-        y2 = min(diff.shape[0], y1 + mask_px["h"])
-        diff[y1:y2, x1:x2] = 1.0
-
-    diff_mask     = diff < 0.5
-    diff_area_pct = diff_mask.sum() / diff_mask.size * 100
+    ssim_score, diff  = ssim_fn(master_gray, aligned, full=True)
+    diff_mask         = diff < 0.5
+    diff_area_pct     = diff_mask.sum() / diff_mask.size * 100
     return ssim_score, diff_area_pct, diff, diff_mask
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SAVE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_result(crop_bgr, verdict):
+    folder = GOOD_DIR if verdict == "GOOD" else BAD_DIR
+    os.makedirs(folder, exist_ok=True)
+    ts  = time.strftime("%Y%m%d_%H%M%S")
+    ms  = int((time.time() % 1) * 1000)
+    out = os.path.join(folder, f"{verdict}_{ts}_{ms:03d}.jpg")
+    cv2.imwrite(out, crop_bgr)
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -386,47 +289,32 @@ TRACKER_COLOR = {
 }
 
 
-def draw_live(frame, region, mask_rel, tracker_state,
-              last_verdict, master_loaded, region_loaded):
+def draw_live(frame, region, tracker_state, last_verdict, master_loaded):
     out = frame.copy()
     fh, fw = frame.shape[:2]
 
-    if region_loaded:
+    if region is not None:
         rx, ry, rw, rh = region["x"], region["y"], region["w"], region["h"]
         color = TRACKER_COLOR.get(tracker_state, (0, 255, 0))
         cv2.rectangle(out, (rx, ry), (rx + rw, ry + rh), color, 2)
-        cv2.putText(out, f"REGION  {tracker_state}",
-                    (rx, ry - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-
-        # Draw mask zone in orange (scaled back to frame coords)
-        if mask_rel is not None:
-            mx = int(rx + mask_rel["rx"] * rw)
-            my = int(ry + mask_rel["ry"] * rh)
-            mw = int(mask_rel["rw"] * rw)
-            mh = int(mask_rel["rh"] * rh)
-            cv2.rectangle(out, (mx, my), (mx + mw, my + mh), (0, 140, 255), 2)
-            cv2.putText(out, "MASK (ignored)", (mx, my - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 140, 255), 1)
+        cv2.putText(out, f"LABEL  {tracker_state}  {rw}x{rh}px",
+                    (rx, max(ry - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
     else:
-        cv2.putText(out, "No region — press S to set up",
-                    (fw // 2 - 180, fh // 2), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (0, 140, 255), 2)
+        cv2.putText(out, "No label detected",
+                    (fw // 2 - 140, fh // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 140, 255), 2)
 
-    # Status bar
     if last_verdict:
         bc = (0, 80, 0) if last_verdict == "GOOD" else (0, 0, 80)
         cv2.rectangle(out, (0, fh - 55), (fw, fh), bc, -1)
-        cv2.putText(out, f"LAST: {last_verdict}   S=setup  M=master  C=check  R=reset  Q=quit",
-                    (10, fh - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(out, f"LAST: {last_verdict}   T=tuner  M=master  C=check  R=reset  Q=quit",
+                    (10, fh - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
     else:
-        if not region_loaded:
-            msg = "Press S to draw the label region"
-            bc  = (50, 30, 10)
-        elif not master_loaded:
-            msg = "Region set — press M to capture master reference"
+        if not master_loaded:
+            msg = "Point camera at label, then press M to capture master"
             bc  = (60, 20, 20)
         else:
-            msg = "Ready — place label in region   S=setup  M=master  C=check  Q=quit"
+            msg = "Ready — T=tuner  M=master  C=check  R=reset  Q=quit"
             bc  = (25, 25, 25)
         cv2.rectangle(out, (0, fh - 38), (fw, fh), bc, -1)
         cv2.putText(out, msg, (10, fh - 10),
@@ -437,7 +325,6 @@ def draw_live(frame, region, mask_rel, tracker_state,
 def draw_result_panel(master_gray, aligned, diff, diff_mask,
                       ssim_score, diff_pct, inliers,
                       verdict, ssim_ok, diff_ok, ssim_thresh, diff_thresh):
-    """4-panel result — same layout as sift_align_diff.py draw_preview."""
     color = (0, 220, 0) if verdict == "GOOD" else (0, 0, 220)
     h = master_gray.shape[0]
 
@@ -490,26 +377,11 @@ def draw_result_panel(master_gray, aligned, diff, diff_mask,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SAVE
-# ══════════════════════════════════════════════════════════════════════════════
-
-def save_result(crop_bgr, verdict):
-    folder = GOOD_DIR if verdict == "GOOD" else BAD_DIR
-    os.makedirs(folder, exist_ok=True)
-    ts  = time.strftime("%Y%m%d_%H%M%S")
-    ms  = int((time.time() % 1) * 1000)
-    out = os.path.join(folder, f"{verdict}_{ts}_{ms:03d}.jpg")
-    cv2.imwrite(out, crop_bgr)
-    return out
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # CHECK HELPER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def crop_region(frame, region):
     rx, ry, rw, rh = region["x"], region["y"], region["w"], region["h"]
-    # Clamp to frame bounds
     x1 = max(0, rx)
     y1 = max(0, ry)
     x2 = min(frame.shape[1], rx + rw)
@@ -517,9 +389,7 @@ def crop_region(frame, region):
     return frame[y1:y2, x1:x2]
 
 
-def run_check(frame, region, master_gray, sift, ssim_thresh, diff_thresh,
-              mask_px=None, tag=""):
-    """Crop region from frame, SIFT align, score. Returns (verdict, panel, crop)."""
+def run_check(frame, region, master_gray, sift, ssim_thresh, diff_thresh, tag=""):
     crop      = crop_region(frame, region)
     test_gray = cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), IMG_SIZE)
 
@@ -528,16 +398,14 @@ def run_check(frame, region, master_gray, sift, ssim_thresh, diff_thresh,
         print(f"  {tag}Low inliers ({inliers}) — alignment failed, skip.")
         return None, None, crop
 
-    ssim_score, diff_pct, diff_map, diff_mask = compute_scores(
-        master_gray, aligned, mask_px)
+    ssim_score, diff_pct, diff_map, diff_mask = compute_scores(master_gray, aligned)
     ssim_ok = ssim_score >= ssim_thresh
     diff_ok = diff_pct   <  diff_thresh
     verdict = "GOOD" if (ssim_ok and diff_ok) else "BAD"
 
     fname = save_result(crop, verdict)
-    mask_note = "  [mask active]" if mask_px else ""
     print(f"  {tag}[{verdict}]  SSIM={ssim_score:.3f}  "
-          f"Diff={diff_pct:.1f}%  Inliers={inliers}{mask_note}  → {fname}")
+          f"Diff={diff_pct:.1f}%  Inliers={inliers}  → {fname}")
 
     panel = draw_result_panel(
         master_gray, aligned, diff_map, diff_mask,
@@ -573,45 +441,6 @@ def main():
 
     sift = cv2.SIFT_create(nfeatures=5000)
 
-    # ── Load region ───────────────────────────────────────────────────
-    region        = None
-    region_loaded = False
-    if os.path.exists(REGION_FILE):
-        with open(REGION_FILE) as f:
-            region = json.load(f)
-        region_loaded = True
-        print(f"Region loaded : x={region['x']} y={region['y']} "
-              f"w={region['w']} h={region['h']}  ({REGION_FILE})")
-    else:
-        print("No region — press S to set up the label area.")
-
-    # ── Load mask ─────────────────────────────────────────────────────
-    mask_rel = None
-    mask_px  = None
-    if os.path.exists(MASK_FILE):
-        with open(MASK_FILE) as f:
-            d = json.load(f)
-        if "rx" in d:
-            mask_rel = d
-        elif region_loaded:
-            # Old absolute format — convert to relative using region
-            rx, ry, rw, rh = region["x"], region["y"], region["w"], region["h"]
-            mask_rel = {
-                "rx": (d["x"] - rx) / rw,
-                "ry": (d["y"] - ry) / rh,
-                "rw": d["w"] / rw,
-                "rh": d["h"] / rh,
-            }
-            with open(MASK_FILE, "w") as f:
-                json.dump(mask_rel, f, indent=2)
-            print(f"Mask converted from old format → {MASK_FILE}")
-        if mask_rel is not None:
-            mask_px = mask_to_pixels(mask_rel)
-            print(f"Mask loaded   : rx={mask_rel['rx']:.3f} ry={mask_rel['ry']:.3f} "
-                  f"rw={mask_rel['rw']:.3f} rh={mask_rel['rh']:.3f}  ({MASK_FILE})")
-    else:
-        print("No mask — press X to draw a zone to ignore (optional).")
-
     # ── Load master ───────────────────────────────────────────────────
     master_gray   = None
     master_loaded = False
@@ -622,15 +451,15 @@ def main():
             master_loaded = True
             print(f"Master loaded : {args.ref}")
     if not master_loaded:
-        print("No master — press M to capture region as reference.")
+        print("No master — point camera at label and press M to capture.")
 
     print(f"Threshold  : SSIM >= {args.ssim}  AND  diff < {args.diff}%  → GOOD")
-    print(f"AUTO_CHECK : {AUTO_CHECK}")
-    print("S=setup  X=mask  M=master  C=check  R=reset  Q=quit\n")
+    print("T=tuner  M=master  C=check  R=reset  Q=quit\n")
 
     tracker      = LabelTracker()
     last_verdict = None
     result_panel = None
+    tuner_open   = False
 
     WIN_LIVE   = "SIFT Live Damage Checker"
     WIN_RESULT = "Result — Master | Aligned | Diff | Heatmap"
@@ -643,23 +472,39 @@ def main():
             time.sleep(0.05)
             continue
 
-        # ── Tracker update using region crop ──────────────────────────
+        # ── Read tuner params if window is open ───────────────────────
+        params = read_tuner() if tuner_open else None
+
+        # ── Detect label region every frame ───────────────────────────
+        region, mask = detect_label(frame, params)
+
+        # ── Show mask preview in tuner window ─────────────────────────
+        if tuner_open:
+            mask_disp = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            if region is not None:
+                rx, ry, rw, rh = region["x"], region["y"], region["w"], region["h"]
+                cv2.rectangle(mask_disp, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
+            cv2.imshow(WIN_TUNER, mask_disp)
+
+        # ── Tracker update ────────────────────────────────────────────
         should_check = False
-        if region_loaded:
+        if region is not None:
             region_crop  = crop_region(frame, region)
             should_check = tracker.update(region_crop)
+        else:
+            tracker.reset()
 
-        # ── Auto-check ────────────────────────────────────────────────
-        if should_check and AUTO_CHECK and master_loaded and region_loaded:
+        # ── Auto-check when stable ────────────────────────────────────
+        if should_check and AUTO_CHECK and master_loaded and region is not None:
             verdict, panel, _ = run_check(
-                frame, region, master_gray, sift, args.ssim, args.diff, mask_px)
+                frame, region, master_gray, sift, args.ssim, args.diff)
             if verdict is not None:
                 last_verdict = verdict
                 result_panel = panel
 
-        # ── Draw live feed ────────────────────────────────────────────
-        display = draw_live(frame, region, mask_rel, tracker.get_state(),
-                            last_verdict, master_loaded, region_loaded)
+        # ── Draw ──────────────────────────────────────────────────────
+        display = draw_live(frame, region, tracker.get_state(),
+                            last_verdict, master_loaded)
         cv2.imshow(WIN_LIVE, display)
 
         if result_panel is not None:
@@ -670,63 +515,45 @@ def main():
         if key in (ord('q'), 27):
             break
 
+        elif key in (ord('t'), ord('T')):
+            tuner_open = not tuner_open
+            if tuner_open:
+                open_tuner()
+                print("Tuner open — adjust S max / V min / Morph k / Min area% / Padding")
+            else:
+                close_tuner()
+                print("Tuner closed.")
+
         elif key in (ord('r'), ord('R')):
             tracker.reset()
             last_verdict = None
             result_panel = None
             print("Reset.")
 
-        elif key in (ord('s'), ord('S')):
-            new_region = run_region_setup(cap)
-            if new_region is not None:
-                region        = new_region
-                region_loaded = True
-                # Clear mask — it was relative to old region
-                mask_rel = None
-                mask_px  = None
-                if os.path.exists(MASK_FILE):
-                    os.remove(MASK_FILE)
-                tracker.reset()
-                last_verdict  = None
-                result_panel  = None
-                print("Region updated — press X for mask, M to capture new master.")
-
-        elif key in (ord('x'), ord('X')):
-            if not region_loaded:
-                print("No region — press S first.")
-            else:
-                new_mask = run_mask_setup(cap, region)
-                if new_mask is not None:
-                    mask_rel = new_mask
-                    mask_px  = mask_to_pixels(mask_rel)
-                    tracker.reset()
-                    last_verdict = None
-                    result_panel = None
-
         elif key in (ord('m'), ord('M')):
-            if not region_loaded:
-                print("No region — press S first.")
+            if region is None:
+                print("No label detected — point camera at label first.")
             else:
-                crop          = crop_region(frame, region)
+                crop = crop_region(frame, region)
                 master_gray   = cv2.resize(
                     cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), IMG_SIZE)
                 master_loaded = True
                 os.makedirs(os.path.dirname(args.ref), exist_ok=True)
                 cv2.imwrite(args.ref, crop)
                 tracker.reset()
-                last_verdict  = None
-                result_panel  = None
+                last_verdict = None
+                result_panel = None
                 print(f"Master captured → {args.ref}")
 
         elif key in (ord('c'), ord('C')):
-            if not region_loaded:
-                print("No region — press S first.")
+            if region is None:
+                print("No label detected.")
             elif not master_loaded:
                 print("No master — press M first.")
             else:
                 verdict, panel, _ = run_check(
                     frame, region, master_gray, sift,
-                    args.ssim, args.diff, mask_px, tag="C/")
+                    args.ssim, args.diff, tag="C/")
                 if verdict is not None:
                     last_verdict = verdict
                     result_panel = panel

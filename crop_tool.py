@@ -37,10 +37,10 @@ INIT = dict(
     mode=1,          # 0=V-only  1=Sat-suppress
     V_low=100,       # V-only mode: brightness floor
     V_high=255,
-    S_max=80,        # Sat-suppress mode: keep pixels with S < this (low-sat = label)
-    V_min_label=80,  # Sat-suppress mode: label must also be reasonably bright
-    blur=9,          # morphology kernel size (odd)
-    min_area=3,      # % of image area minimum
+    S_max=241,       # Sat-suppress mode: keep pixels with S < this (low-sat = label)
+    V_min_label=107, # Sat-suppress mode: label must also be reasonably bright
+    blur=6,          # morphology kernel size (odd — will be incremented to 7)
+    min_area=4,      # % of image area minimum
 )
 
 
