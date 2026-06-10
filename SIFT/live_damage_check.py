@@ -53,7 +53,7 @@ BAD_DIR  = os.path.join(BASE_DIR, "results", "bad")
 # ── SIFT / SSIM ────────────────────────────────────────────────────────────────
 IMG_SIZE       = (800, 600)
 SSIM_PASS      = 0.75
-DIFF_AREA_FAIL = 8.0
+DIFF_AREA_FAIL = 3.0
 RATIO_TEST     = 0.75
 MIN_INLIERS    = 40
 
@@ -80,7 +80,7 @@ WRINKLE_CHI_THR  = 0.20   # chi-squared distance per cell that counts as wrinkle
 
 # ── Label detector (from crop_tool.py) ────────────────────────────────────────
 AD_S_MAX        = 255   # max saturation to be considered a label pixel
-AD_V_MIN        = 107   # min brightness to be considered a label pixel
+AD_V_MIN        = 174   # min brightness to be considered a label pixel
 AD_MORPH_K      = 7     # morphology kernel size (odd)
 AD_MIN_AREA_PCT = 4     # % of frame area — smaller blobs ignored
 AD_PADDING      = 0    # pixels of padding added around detected bbox
