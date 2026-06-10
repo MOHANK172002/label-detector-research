@@ -61,12 +61,29 @@ MIN_INLIERS    = 40
 CHECK_COOLDOWN = 2.0        # seconds between auto-checks
 AUTO_CHECK     = True
 
+# ── Pen / mark detection ───────────────────────────────────────────────────────
+# Strategy: work from the SSIM diff map (not raw pixel difference).
+# Pen strokes appear as elongated diff blobs with high aspect ratio.
+# Large minimum area prevents normal text/print from triggering false positives.
+PEN_SSIM_THRESH  = 0.55   # SSIM below this = candidate diff pixel
+PEN_MIN_AREA     = 400    # ignore blobs smaller than this — text chars are ~50-150px
+PEN_MAX_AREA     = 8000   # blobs larger than this are general damage, not strokes
+PEN_MIN_ASPECT   = 3.0    # length:width ratio — pen strokes are very elongated
+PEN_FAIL_COUNT   = 2      # need ≥2 qualifying stroke blobs to call BAD (reduces noise)
+
+# ── Wrinkle detection (LBP texture) ───────────────────────────────────────────
+# LBP captures micro-texture patterns. Wrinkles change local texture even when
+# average intensity is similar. Fine grid + Gaussian smoothing avoids block artefacts.
+WRINKLE_CELLS    = 16     # finer grid (16×16) for smooth spatial resolution
+WRINKLE_FAIL     = 0.30   # fraction of cells exceeding chi-sq threshold → BAD
+WRINKLE_CHI_THR  = 0.20   # chi-squared distance per cell that counts as wrinkled
+
 # ── Label detector (from crop_tool.py) ────────────────────────────────────────
-AD_S_MAX        = 241   # max saturation to be considered a label pixel
+AD_S_MAX        = 255   # max saturation to be considered a label pixel
 AD_V_MIN        = 107   # min brightness to be considered a label pixel
 AD_MORPH_K      = 7     # morphology kernel size (odd)
 AD_MIN_AREA_PCT = 4     # % of frame area — smaller blobs ignored
-AD_PADDING      = 6     # pixels of padding added around detected bbox
+AD_PADDING      = 0    # pixels of padding added around detected bbox
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -80,11 +97,19 @@ def _nothing(_):
 
 def open_tuner():
     cv2.namedWindow(WIN_TUNER, cv2.WINDOW_NORMAL)
-    cv2.createTrackbar("S max",     WIN_TUNER, AD_S_MAX,        255, _nothing)
-    cv2.createTrackbar("V min",     WIN_TUNER, AD_V_MIN,        255, _nothing)
-    cv2.createTrackbar("Morph k",   WIN_TUNER, AD_MORPH_K,       31, _nothing)
-    cv2.createTrackbar("Min area%", WIN_TUNER, AD_MIN_AREA_PCT,  50, _nothing)
-    cv2.createTrackbar("Padding",   WIN_TUNER, AD_PADDING,       40, _nothing)
+    # ── Label detector ──────────────────────────────────────────────────
+    cv2.createTrackbar("S max",           WIN_TUNER, AD_S_MAX,                     255, _nothing)
+    cv2.createTrackbar("V min",           WIN_TUNER, AD_V_MIN,                     255, _nothing)
+    cv2.createTrackbar("Morph k",         WIN_TUNER, AD_MORPH_K,                    31, _nothing)
+    cv2.createTrackbar("Min area%",       WIN_TUNER, AD_MIN_AREA_PCT,               50, _nothing)
+    cv2.createTrackbar("Padding",         WIN_TUNER, AD_PADDING,                    40, _nothing)
+    # ── Pen / mark detection ────────────────────────────────────────────
+    cv2.createTrackbar("Pen max area",    WIN_TUNER, PEN_MAX_AREA,               10000, _nothing)
+    cv2.createTrackbar("Pen min aspect",  WIN_TUNER, int(PEN_MIN_ASPECT * 10),      80, _nothing)
+    cv2.createTrackbar("Pen fail blobs",  WIN_TUNER, PEN_FAIL_COUNT,               10, _nothing)
+    # ── Wrinkle detection ───────────────────────────────────────────────
+    cv2.createTrackbar("Wrinkle fail%",   WIN_TUNER, int(WRINKLE_FAIL * 100),      100, _nothing)
+    cv2.createTrackbar("Wrinkle chi",     WIN_TUNER, int(WRINKLE_CHI_THR * 100),   100, _nothing)
 
 def close_tuner():
     try:
@@ -95,13 +120,18 @@ def close_tuner():
 def read_tuner():
     """Read current trackbar values. Returns a params dict."""
     k = cv2.getTrackbarPos("Morph k", WIN_TUNER)
-    k = max(k + (0 if k % 2 == 1 else 1), 1)   # force odd, min 1
+    k = max(k + (0 if k % 2 == 1 else 1), 1)
     return {
-        "s_max":    cv2.getTrackbarPos("S max",     WIN_TUNER),
-        "v_min":    cv2.getTrackbarPos("V min",     WIN_TUNER),
-        "morph_k":  k,
-        "min_area": cv2.getTrackbarPos("Min area%", WIN_TUNER),
-        "padding":  cv2.getTrackbarPos("Padding",   WIN_TUNER),
+        "s_max":          cv2.getTrackbarPos("S max",           WIN_TUNER),
+        "v_min":          cv2.getTrackbarPos("V min",           WIN_TUNER),
+        "morph_k":        k,
+        "min_area":       cv2.getTrackbarPos("Min area%",       WIN_TUNER),
+        "padding":        cv2.getTrackbarPos("Padding",         WIN_TUNER),
+        "pen_max_area":   cv2.getTrackbarPos("Pen max area",    WIN_TUNER),
+        "pen_min_aspect": cv2.getTrackbarPos("Pen min aspect",  WIN_TUNER) / 10.0,
+        "pen_fail_count": cv2.getTrackbarPos("Pen fail blobs",  WIN_TUNER),
+        "wrinkle_fail":   cv2.getTrackbarPos("Wrinkle fail%",   WIN_TUNER) / 100.0,
+        "wrinkle_chi":    cv2.getTrackbarPos("Wrinkle chi",     WIN_TUNER) / 100.0,
     }
 
 
@@ -252,16 +282,124 @@ def sift_align(master_gray, test_gray, sift):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SCORING
+# SCORING — SSIM + PEN MARKS + WRINKLES
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_scores(master_gray, aligned):
+def detect_pen_marks(aligned, ssim_diff, params=None):
+    """
+    Detect pen/marker strokes from the SSIM diff map.
+    Works on the diff map (not raw pixel difference) so normal printing
+    variations and slight misalignment don't trigger false positives.
+
+    Pen strokes show as elongated diff blobs: high aspect ratio bounding rect.
+    Returns (stroke_blob_count, overlay_bgr).
+    """
+    max_area   = params["pen_max_area"]   if params else PEN_MAX_AREA
+    min_aspect = params["pen_min_aspect"] if params else PEN_MIN_ASPECT
+
+    # Threshold the SSIM map — pixels where SSIM is LOW = something changed here
+    # ssim_diff values: 1.0 = identical, 0.0 = completely different
+    diff_bin = (ssim_diff < PEN_SSIM_THRESH).astype(np.uint8) * 255
+
+    # Small close to connect broken stroke pixels
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_CLOSE, k)
+
+    pen_mask = np.zeros_like(diff_bin)
+    stroke_count = 0
+    cnts, _ = cv2.findContours(diff_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in cnts:
+        area = cv2.contourArea(cnt)
+        if area < PEN_MIN_AREA or area > max_area:
+            continue
+        # Fit a rotated rect to get the true aspect ratio regardless of angle
+        rect  = cv2.minAreaRect(cnt)
+        rw, rh = rect[1]
+        if rw == 0 or rh == 0:
+            continue
+        aspect = max(rw, rh) / min(rw, rh)
+        if aspect >= min_aspect:
+            cv2.drawContours(pen_mask, [cnt], -1, 255, -1)
+            stroke_count += 1
+
+    overlay = cv2.cvtColor(aligned, cv2.COLOR_GRAY2BGR)
+    overlay[pen_mask > 0] = (255, 0, 255)
+    cv2.putText(overlay, f"PEN  {stroke_count} stroke(s)",
+                (10, aligned.shape[0] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+    return stroke_count, overlay
+
+
+def _lbp(gray):
+    """Compute a simple 8-neighbour LBP image (no external lib needed)."""
+    h, w   = gray.shape
+    g      = gray.astype(np.int16)
+    lbp    = np.zeros((h, w), dtype=np.uint8)
+    angles = [(-1,-1),(-1,0),(-1,1),(0,1),(1,1),(1,0),(1,-1),(0,-1)]
+    for bit, (dy, dx) in enumerate(angles):
+        shifted = np.roll(np.roll(g, dy, axis=0), dx, axis=1)
+        lbp    |= ((g >= shifted).astype(np.uint8) << bit)
+    return lbp
+
+
+def detect_wrinkles(master_gray, aligned, params=None):
+    """
+    Compare LBP texture histograms in a grid of cells.
+    Wrinkles deform local surface texture even when average intensity is similar.
+    Returns (bad_cell_fraction, heatmap_bgr).
+    """
+    chi_thr = params["wrinkle_chi"] if params else WRINKLE_CHI_THR
+    cells   = WRINKLE_CELLS
+    h, w    = master_gray.shape
+    ch, cw  = h // cells, w // cells
+
+    lbp_m = _lbp(master_gray)
+    lbp_a = _lbp(aligned)
+
+    heat   = np.zeros((h, w), dtype=np.float32)
+    bad    = 0
+    total  = 0
+
+    for r in range(cells):
+        for c in range(cells):
+            y0, y1 = r * ch, (r + 1) * ch
+            x0, x1 = c * cw, (c + 1) * cw
+            hm, _  = np.histogram(lbp_m[y0:y1, x0:x1], bins=256, range=(0, 255))
+            ha, _  = np.histogram(lbp_a[y0:y1, x0:x1], bins=256, range=(0, 255))
+            hm     = hm.astype(np.float32) + 1e-6
+            ha     = ha.astype(np.float32) + 1e-6
+            hm    /= hm.sum();  ha /= ha.sum()
+            # Chi-squared distance
+            chi    = float(0.5 * np.sum((hm - ha) ** 2 / (hm + ha)))
+            heat[y0:y1, x0:x1] = chi
+            total += 1
+            if chi > chi_thr:
+                bad += 1
+
+    score    = bad / total if total > 0 else 0.0
+    heat_n   = np.clip(heat / max(heat.max(), 1e-6), 0, 1)
+    # Gaussian blur removes hard block edges from the cell grid
+    heat_smooth = cv2.GaussianBlur(heat_n, (31, 31), 0)
+    heatmap  = cv2.applyColorMap((heat_smooth * 255).astype(np.uint8), cv2.COLORMAP_HOT)
+    cv2.putText(heatmap, f"WRINKLE  {score:.2f}",
+                (10, aligned.shape[0] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    return score, heatmap
+
+
+def compute_scores(master_gray, aligned, params=None):
     if aligned.shape != master_gray.shape:
         aligned = cv2.resize(aligned, (master_gray.shape[1], master_gray.shape[0]))
-    ssim_score, diff  = ssim_fn(master_gray, aligned, full=True)
-    diff_mask         = diff < 0.5
-    diff_area_pct     = diff_mask.sum() / diff_mask.size * 100
-    return ssim_score, diff_area_pct, diff, diff_mask
+
+    ssim_score, diff = ssim_fn(master_gray, aligned, full=True)
+    diff_mask        = diff < 0.5
+    diff_area_pct    = diff_mask.sum() / diff_mask.size * 100
+
+    pen_pixels,   pen_overlay     = detect_pen_marks(aligned, diff, params)
+    wrinkle_score, wrinkle_map    = detect_wrinkles(master_gray, aligned, params)
+
+    return (ssim_score, diff_area_pct, diff, diff_mask,
+            pen_pixels, pen_overlay, wrinkle_score, wrinkle_map)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -322,9 +460,11 @@ def draw_live(frame, region, tracker_state, last_verdict, master_loaded):
     return out
 
 
-def draw_result_panel(master_gray, aligned, diff, diff_mask,
+def draw_result_panel(master_gray, aligned, diff_mask,
                       ssim_score, diff_pct, inliers,
-                      verdict, ssim_ok, diff_ok, ssim_thresh, diff_thresh):
+                      pen_pixels, pen_overlay, wrinkle_score, wrinkle_map,
+                      verdict, ssim_ok, diff_ok, pen_ok, wrinkle_ok,
+                      ssim_thresh, diff_thresh, pen_fail, wrinkle_fail):
     color = (0, 220, 0) if verdict == "GOOD" else (0, 0, 220)
     h = master_gray.shape[0]
 
@@ -336,14 +476,22 @@ def draw_result_panel(master_gray, aligned, diff, diff_mask,
     cv2.putText(p2, "ALIGNED TEST", (10, h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
+    # p3: SSIM diff overlay (blue) + pen marks (magenta)
     p3 = cv2.cvtColor(aligned, cv2.COLOR_GRAY2BGR)
     p3[diff_mask] = (0, 0, 220)
-    cv2.putText(p3, f"DIFF  {diff_pct:.1f}%", (10, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 220), 2)
+    # overlay pen strokes in magenta on top
+    pen_bin = cv2.cvtColor(pen_overlay, cv2.COLOR_BGR2GRAY)
+    pen_bin = (pen_bin == 0) & (pen_overlay[:, :, 0] == 255)  # magenta pixels
+    p3[pen_bin] = (255, 0, 255)
+    cv2.putText(p3, f"DIFF {diff_pct:.1f}%  PEN {pen_pixels}px",
+                (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (0, 0, 220) if diff_ok and pen_ok else (0, 0, 220), 2)
 
-    p4 = cv2.applyColorMap((diff * 255).astype(np.uint8), cv2.COLORMAP_JET)
-    cv2.putText(p4, "HEATMAP (BLUE=diff)", (10, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    # p4: wrinkle heatmap
+    p4 = wrinkle_map.copy()
+    cv2.putText(p4, f"WRINKLE {wrinkle_score:.1f}", (10, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (0, 255, 0) if wrinkle_ok else (0, 0, 255), 2)
 
     ph = 280
     def rs(img):
@@ -353,25 +501,33 @@ def draw_result_panel(master_gray, aligned, diff, diff_mask,
     grid = np.vstack([np.hstack([rs(p1), rs(p2)]),
                       np.hstack([rs(p3), rs(p4)])])
 
-    bar = np.full((90, grid.shape[1], 3), 25, dtype=np.uint8)
-    sc  = (0, 220, 0) if ssim_ok else (0, 0, 220)
-    dc  = (0, 220, 0) if diff_ok  else (0, 0, 220)
+    bar = np.full((110, grid.shape[1], 3), 25, dtype=np.uint8)
+    sc  = (0, 220, 0) if ssim_ok     else (0, 0, 220)
+    dc  = (0, 220, 0) if diff_ok     else (0, 0, 220)
+    pc  = (0, 220, 0) if pen_ok      else (255, 0, 255)
+    wc  = (0, 220, 0) if wrinkle_ok  else (0, 180, 255)
 
     cv2.putText(bar, f"Inliers: {inliers}",
-                (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
+                (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
     cv2.putText(bar, f"SSIM: {ssim_score:.3f}",
-                (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7, sc, 2)
+                (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, sc, 2)
     cv2.putText(bar, f"Diff: {diff_pct:.1f}%",
-                (230, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7, dc, 2)
+                (220, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, dc, 2)
+    cv2.putText(bar, f"Pen: {pen_pixels}px",
+                (400, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, pc, 2)
+    cv2.putText(bar, f"Wrinkle: {wrinkle_score:.1f}",
+                (570, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, wc, 2)
     cv2.putText(bar, f">>  {verdict}",
-                (430, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                (800, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
     reason = []
-    if not ssim_ok: reason.append(f"SSIM {ssim_score:.3f} < {ssim_thresh}")
-    if not diff_ok: reason.append(f"diff {diff_pct:.1f}% >= {diff_thresh}%")
+    if not ssim_ok:    reason.append(f"SSIM {ssim_score:.3f}<{ssim_thresh}")
+    if not diff_ok:    reason.append(f"diff {diff_pct:.1f}%>={diff_thresh}%")
+    if not pen_ok:     reason.append(f"pen {pen_pixels}px>={pen_fail}px")
+    if not wrinkle_ok: reason.append(f"wrinkle {wrinkle_score:.1f}>={wrinkle_fail}")
     if reason:
-        cv2.putText(bar, "  [" + "  &  ".join(reason) + "]",
-                    (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 120), 1)
+        cv2.putText(bar, "  BAD: " + "  |  ".join(reason),
+                    (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 80, 255), 1)
 
     return np.vstack([bar, grid])
 
@@ -389,7 +545,8 @@ def crop_region(frame, region):
     return frame[y1:y2, x1:x2]
 
 
-def run_check(frame, region, master_gray, sift, ssim_thresh, diff_thresh, tag=""):
+def run_check(frame, region, master_gray, sift, ssim_thresh, diff_thresh,
+              params=None, tag=""):
     crop      = crop_region(frame, region)
     test_gray = cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), IMG_SIZE)
 
@@ -398,19 +555,29 @@ def run_check(frame, region, master_gray, sift, ssim_thresh, diff_thresh, tag=""
         print(f"  {tag}Low inliers ({inliers}) — alignment failed, skip.")
         return None, None, crop
 
-    ssim_score, diff_pct, diff_map, diff_mask = compute_scores(master_gray, aligned)
-    ssim_ok = ssim_score >= ssim_thresh
-    diff_ok = diff_pct   <  diff_thresh
-    verdict = "GOOD" if (ssim_ok and diff_ok) else "BAD"
+    (ssim_score, diff_pct, _, diff_mask,
+     pen_pixels, pen_overlay,
+     wrinkle_score, wrinkle_map) = compute_scores(master_gray, aligned, params)
+
+    pen_fail     = params["pen_fail_count"] if params else PEN_FAIL_COUNT
+    wrinkle_fail = params["wrinkle_fail"] if params else WRINKLE_FAIL
+
+    ssim_ok    = ssim_score   >= ssim_thresh
+    diff_ok    = diff_pct     <  diff_thresh
+    pen_ok     = pen_pixels   <  pen_fail   # pen_pixels = stroke blob count
+    wrinkle_ok = wrinkle_score < wrinkle_fail
+    verdict    = "GOOD" if (ssim_ok and diff_ok and pen_ok and wrinkle_ok) else "BAD"
 
     fname = save_result(crop, verdict)
-    print(f"  {tag}[{verdict}]  SSIM={ssim_score:.3f}  "
-          f"Diff={diff_pct:.1f}%  Inliers={inliers}  → {fname}")
+    print(f"  {tag}[{verdict}]  SSIM={ssim_score:.3f}  Diff={diff_pct:.1f}%  "
+          f"Pen={pen_pixels} blob(s)  Wrinkle={wrinkle_score:.2f}  Inliers={inliers}  → {fname}")
 
     panel = draw_result_panel(
-        master_gray, aligned, diff_map, diff_mask,
+        master_gray, aligned, diff_mask,
         ssim_score, diff_pct, inliers,
-        verdict, ssim_ok, diff_ok, ssim_thresh, diff_thresh)
+        pen_pixels, pen_overlay, wrinkle_score, wrinkle_map,
+        verdict, ssim_ok, diff_ok, pen_ok, wrinkle_ok,
+        ssim_thresh, diff_thresh, pen_fail, wrinkle_fail)
 
     return verdict, panel, crop
 
@@ -497,7 +664,7 @@ def main():
         # ── Auto-check when stable ────────────────────────────────────
         if should_check and AUTO_CHECK and master_loaded and region is not None:
             verdict, panel, _ = run_check(
-                frame, region, master_gray, sift, args.ssim, args.diff)
+                frame, region, master_gray, sift, args.ssim, args.diff, params)
             if verdict is not None:
                 last_verdict = verdict
                 result_panel = panel
@@ -553,7 +720,7 @@ def main():
             else:
                 verdict, panel, _ = run_check(
                     frame, region, master_gray, sift,
-                    args.ssim, args.diff, tag="C/")
+                    args.ssim, args.diff, params, tag="C/")
                 if verdict is not None:
                     last_verdict = verdict
                     result_panel = panel
