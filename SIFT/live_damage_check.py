@@ -61,22 +61,21 @@ MIN_INLIERS    = 40
 CHECK_COOLDOWN = 2.0        # seconds between auto-checks
 AUTO_CHECK     = True
 
+# ── Feature flags ─────────────────────────────────────────────────────────────
+ENABLE_PEN_CHECK     = False   # set True to enable pen/marker detection
+ENABLE_WRINKLE_CHECK = False   # set True to enable wrinkle detection
+
 # ── Pen / mark detection ───────────────────────────────────────────────────────
-# Strategy: work from the SSIM diff map (not raw pixel difference).
-# Pen strokes appear as elongated diff blobs with high aspect ratio.
-# Large minimum area prevents normal text/print from triggering false positives.
-PEN_SSIM_THRESH  = 0.55   # SSIM below this = candidate diff pixel
-PEN_MIN_AREA     = 400    # ignore blobs smaller than this — text chars are ~50-150px
-PEN_MAX_AREA     = 8000   # blobs larger than this are general damage, not strokes
-PEN_MIN_ASPECT   = 3.0    # length:width ratio — pen strokes are very elongated
-PEN_FAIL_COUNT   = 2      # need ≥2 qualifying stroke blobs to call BAD (reduces noise)
+PEN_SSIM_THRESH  = 0.55
+PEN_MIN_AREA     = 400
+PEN_MAX_AREA     = 8000
+PEN_MIN_ASPECT   = 3.0
+PEN_FAIL_COUNT   = 2
 
 # ── Wrinkle detection (LBP texture) ───────────────────────────────────────────
-# LBP captures micro-texture patterns. Wrinkles change local texture even when
-# average intensity is similar. Fine grid + Gaussian smoothing avoids block artefacts.
-WRINKLE_CELLS    = 16     # finer grid (16×16) for smooth spatial resolution
-WRINKLE_FAIL     = 0.30   # fraction of cells exceeding chi-sq threshold → BAD
-WRINKLE_CHI_THR  = 0.20   # chi-squared distance per cell that counts as wrinkled
+WRINKLE_CELLS    = 16
+WRINKLE_FAIL     = 0.30
+WRINKLE_CHI_THR  = 0.20
 
 # ── Label detector (from crop_tool.py) ────────────────────────────────────────
 AD_S_MAX        = 255   # max saturation to be considered a label pixel
@@ -483,13 +482,18 @@ def draw_result_panel(master_gray, aligned, diff_mask,
     pen_bin = cv2.cvtColor(pen_overlay, cv2.COLOR_BGR2GRAY)
     pen_bin = (pen_bin == 0) & (pen_overlay[:, :, 0] == 255)  # magenta pixels
     p3[pen_bin] = (255, 0, 255)
-    cv2.putText(p3, f"DIFF {diff_pct:.1f}%  PEN {pen_pixels}px",
-                (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                (0, 0, 220) if diff_ok and pen_ok else (0, 0, 220), 2)
+    diff_label = f"DIFF {diff_pct:.1f}%"
+    if ENABLE_PEN_CHECK:
+        diff_label += f"  PEN {pen_pixels} blob(s)"
+    cv2.putText(p3, diff_label, (10, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 220), 2)
 
     # p4: wrinkle heatmap
     p4 = wrinkle_map.copy()
-    cv2.putText(p4, f"WRINKLE {wrinkle_score:.1f}", (10, h - 10),
+    wrinkle_label = f"WRINKLE {wrinkle_score:.2f}"
+    if not ENABLE_WRINKLE_CHECK:
+        wrinkle_label += "  (disabled)"
+    cv2.putText(p4, wrinkle_label, (10, h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                 (0, 255, 0) if wrinkle_ok else (0, 0, 255), 2)
 
@@ -502,10 +506,11 @@ def draw_result_panel(master_gray, aligned, diff_mask,
                       np.hstack([rs(p3), rs(p4)])])
 
     bar = np.full((110, grid.shape[1], 3), 25, dtype=np.uint8)
-    sc  = (0, 220, 0) if ssim_ok     else (0, 0, 220)
-    dc  = (0, 220, 0) if diff_ok     else (0, 0, 220)
-    pc  = (0, 220, 0) if pen_ok      else (255, 0, 255)
-    wc  = (0, 220, 0) if wrinkle_ok  else (0, 180, 255)
+    sc  = (0, 220, 0) if ssim_ok else (0, 0, 220)
+    dc  = (0, 220, 0) if diff_ok else (0, 0, 220)
+    pc  = (0, 220, 0) if pen_ok  else (255, 0, 255)
+    wc  = (0, 220, 0) if wrinkle_ok else (0, 180, 255)
+    dim = (120, 120, 120)   # colour for disabled metrics
 
     cv2.putText(bar, f"Inliers: {inliers}",
                 (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
@@ -513,18 +518,20 @@ def draw_result_panel(master_gray, aligned, diff_mask,
                 (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, sc, 2)
     cv2.putText(bar, f"Diff: {diff_pct:.1f}%",
                 (220, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, dc, 2)
-    cv2.putText(bar, f"Pen: {pen_pixels}px",
-                (400, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, pc, 2)
-    cv2.putText(bar, f"Wrinkle: {wrinkle_score:.1f}",
-                (570, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, wc, 2)
+    # cv2.putText(bar, f"Pen: {pen_pixels}" + (" [OFF]" if not ENABLE_PEN_CHECK else ""),
+    #             (400, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+    #             dim if not ENABLE_PEN_CHECK else pc, 2)
+    # cv2.putText(bar, f"Wrinkle: {wrinkle_score:.2f}" + (" [OFF]" if not ENABLE_WRINKLE_CHECK else ""),
+    #             (570, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+    #             dim if not ENABLE_WRINKLE_CHECK else wc, 2)
     cv2.putText(bar, f">>  {verdict}",
                 (800, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
     reason = []
-    if not ssim_ok:    reason.append(f"SSIM {ssim_score:.3f}<{ssim_thresh}")
-    if not diff_ok:    reason.append(f"diff {diff_pct:.1f}%>={diff_thresh}%")
-    if not pen_ok:     reason.append(f"pen {pen_pixels}px>={pen_fail}px")
-    if not wrinkle_ok: reason.append(f"wrinkle {wrinkle_score:.1f}>={wrinkle_fail}")
+    if not ssim_ok: reason.append(f"SSIM {ssim_score:.3f}<{ssim_thresh}")
+    if not diff_ok: reason.append(f"diff {diff_pct:.1f}%>={diff_thresh}%")
+    if ENABLE_PEN_CHECK     and not pen_ok:     reason.append(f"pen {pen_pixels}>={pen_fail}")
+    if ENABLE_WRINKLE_CHECK and not wrinkle_ok: reason.append(f"wrinkle {wrinkle_score:.2f}>={wrinkle_fail}")
     if reason:
         cv2.putText(bar, "  BAD: " + "  |  ".join(reason),
                     (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 80, 255), 1)
@@ -564,8 +571,8 @@ def run_check(frame, region, master_gray, sift, ssim_thresh, diff_thresh,
 
     ssim_ok    = ssim_score   >= ssim_thresh
     diff_ok    = diff_pct     <  diff_thresh
-    pen_ok     = pen_pixels   <  pen_fail   # pen_pixels = stroke blob count
-    wrinkle_ok = wrinkle_score < wrinkle_fail
+    pen_ok     = (pen_pixels < pen_fail) if ENABLE_PEN_CHECK     else True
+    wrinkle_ok = (wrinkle_score < wrinkle_fail) if ENABLE_WRINKLE_CHECK else True
     verdict    = "GOOD" if (ssim_ok and diff_ok and pen_ok and wrinkle_ok) else "BAD"
 
     fname = save_result(crop, verdict)
