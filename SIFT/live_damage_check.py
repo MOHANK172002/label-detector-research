@@ -505,27 +505,37 @@ def draw_result_panel(master_gray, aligned, diff_mask,
     grid = np.vstack([np.hstack([rs(p1), rs(p2)]),
                       np.hstack([rs(p3), rs(p4)])])
 
-    bar = np.full((110, grid.shape[1], 3), 25, dtype=np.uint8)
-    sc  = (0, 220, 0) if ssim_ok else (0, 0, 220)
-    dc  = (0, 220, 0) if diff_ok else (0, 0, 220)
-    pc  = (0, 220, 0) if pen_ok  else (255, 0, 255)
-    wc  = (0, 220, 0) if wrinkle_ok else (0, 180, 255)
-    dim = (120, 120, 120)   # colour for disabled metrics
+    W = grid.shape[1]
 
-    cv2.putText(bar, f"Inliers: {inliers}",
-                (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+    # ── Large verdict banner ───────────────────────────────────────────────────
+    banner = np.full((120, W, 3),
+                     (0, 60, 0) if verdict == "GOOD" else (0, 0, 80),
+                     dtype=np.uint8)
+    txt_size, _ = cv2.getTextSize(verdict, cv2.FONT_HERSHEY_SIMPLEX, 3.5, 6)
+    tx = (W - txt_size[0]) // 2
+    cv2.putText(banner, verdict, (tx, 95),
+                cv2.FONT_HERSHEY_SIMPLEX, 3.5, color, 6, cv2.LINE_AA)
+
+    # ── Metrics bar ───────────────────────────────────────────────────────────
+    sc  = (0, 220, 0) if ssim_ok    else (0, 0, 220)
+    dc  = (0, 220, 0) if diff_ok    else (0, 0, 220)
+    pc  = (0, 220, 0) if pen_ok     else (255, 0, 255)
+    wc  = (0, 220, 0) if wrinkle_ok else (0, 180, 255)
+    dim = (120, 120, 120)
+
+    bar = np.full((70, W, 3), 25, dtype=np.uint8)
+    # cv2.putText(bar, f"Inliers: {inliers}",
+    #             (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
     cv2.putText(bar, f"SSIM: {ssim_score:.3f}",
-                (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, sc, 2)
+                (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.7, sc, 2)
     cv2.putText(bar, f"Diff: {diff_pct:.1f}%",
-                (220, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, dc, 2)
+                (240, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.7, dc, 2)
     # cv2.putText(bar, f"Pen: {pen_pixels}" + (" [OFF]" if not ENABLE_PEN_CHECK else ""),
-    #             (400, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+    #             (440, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
     #             dim if not ENABLE_PEN_CHECK else pc, 2)
     # cv2.putText(bar, f"Wrinkle: {wrinkle_score:.2f}" + (" [OFF]" if not ENABLE_WRINKLE_CHECK else ""),
-    #             (570, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+    #             (640, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
     #             dim if not ENABLE_WRINKLE_CHECK else wc, 2)
-    cv2.putText(bar, f">>  {verdict}",
-                (800, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
     reason = []
     if not ssim_ok: reason.append(f"SSIM {ssim_score:.3f}<{ssim_thresh}")
@@ -533,10 +543,10 @@ def draw_result_panel(master_gray, aligned, diff_mask,
     if ENABLE_PEN_CHECK     and not pen_ok:     reason.append(f"pen {pen_pixels}>={pen_fail}")
     if ENABLE_WRINKLE_CHECK and not wrinkle_ok: reason.append(f"wrinkle {wrinkle_score:.2f}>={wrinkle_fail}")
     if reason:
-        cv2.putText(bar, "  BAD: " + "  |  ".join(reason),
-                    (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 80, 255), 1)
+        cv2.putText(bar, "BAD: " + "  |  ".join(reason),
+                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 255), 1)
 
-    return np.vstack([bar, grid])
+    return np.vstack([banner, bar, grid])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
