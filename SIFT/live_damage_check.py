@@ -64,6 +64,7 @@ AUTO_CHECK     = True
 # ── Feature flags ─────────────────────────────────────────────────────────────
 ENABLE_PEN_CHECK     = False   # set True to enable pen/marker detection
 ENABLE_WRINKLE_CHECK = False   # set True to enable wrinkle detection
+ENABLE_ZONE_CHECK    = True    # detect missing text/logos via zoned SSIM
 
 # ── Pen / mark detection ───────────────────────────────────────────────────────
 PEN_SSIM_THRESH  = 0.55
@@ -76,6 +77,13 @@ PEN_FAIL_COUNT   = 2
 WRINKLE_CELLS    = 16
 WRINKLE_FAIL     = 0.30
 WRINKLE_CHI_THR  = 0.20
+
+# ── Zone-based missing content detection ──────────────────────────────────────
+ZONE_COLS        = 40     # grid columns
+ZONE_ROWS        = 40    # grid rows
+ZONE_SSIM_THR    = 0.60  # per-zone SSIM below this = content missing in zone
+ZONE_FAIL_COUNT  = 1    # how many bad zones before verdict = BAD
+ZONE_EDGE_PCT    = 0.0  # fraction of label width/height to ignore at each edge
 
 # ── Label detector (from crop_tool.py) ────────────────────────────────────────
 AD_S_MAX        = 255   # max saturation to be considered a label pixel
@@ -386,6 +394,65 @@ def detect_wrinkles(master_gray, aligned, params=None):
     return score, heatmap
 
 
+def detect_zone_missing(master_gray, aligned):
+    """
+    Divide the label into a grid, skipping edge zones.
+    For each interior zone compare local SSIM master vs aligned.
+    Zones with SSIM < ZONE_SSIM_THR are flagged as missing content.
+    Returns (bad_zone_count, zone_heatmap_bgr, list_of_bad_zone_rects).
+    """
+    h, w = master_gray.shape
+    edge_x = int(w * ZONE_EDGE_PCT)
+    edge_y = int(h * ZONE_EDGE_PCT)
+
+    cw = (w - 2 * edge_x) // ZONE_COLS
+    ch = (h - 2 * edge_y) // ZONE_ROWS
+
+    heat = np.zeros((h, w), dtype=np.float32)
+    bad_zones   = 0
+    bad_rects   = []
+
+    for r in range(ZONE_ROWS):
+        for c in range(ZONE_COLS):
+            x0 = edge_x + c * cw
+            y0 = edge_y + r * ch
+            x1 = x0 + cw
+            y1 = y0 + ch
+
+            zm = master_gray[y0:y1, x0:x1]
+            za = aligned[y0:y1, x0:x1]
+
+            if zm.shape[0] < 8 or zm.shape[1] < 8:
+                continue
+
+            win = min(zm.shape[0], zm.shape[1])
+            win = win if win % 2 == 1 else win - 1
+            win = max(win, 7)
+
+            score = ssim_fn(zm, za, win_size=win)
+            heat[y0:y1, x0:x1] = score
+
+            if score < ZONE_SSIM_THR:
+                bad_zones += 1
+                bad_rects.append((x0, y0, x1, y1))
+
+    # Heatmap: cold (blue) = high SSIM (good), hot (red) = low SSIM (missing)
+    inverted = np.clip(1.0 - heat, 0, 1)
+    hmap = cv2.applyColorMap((inverted * 255).astype(np.uint8), cv2.COLORMAP_JET)
+
+    # Draw red rectangles on bad zones
+    for (x0, y0, x1, y1) in bad_rects:
+        cv2.rectangle(hmap, (x0, y0), (x1, y1), (0, 0, 255), 2)
+
+    label = f"ZONES  {bad_zones}/{ZONE_COLS * ZONE_ROWS} bad"
+    if not ENABLE_ZONE_CHECK:
+        label += "  (disabled)"
+    cv2.putText(hmap, label, (10, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (0, 0, 255) if bad_zones >= ZONE_FAIL_COUNT else (0, 255, 0), 2)
+    return bad_zones, hmap, bad_rects
+
+
 def compute_scores(master_gray, aligned, params=None):
     if aligned.shape != master_gray.shape:
         aligned = cv2.resize(aligned, (master_gray.shape[1], master_gray.shape[0]))
@@ -396,9 +463,11 @@ def compute_scores(master_gray, aligned, params=None):
 
     pen_pixels,   pen_overlay     = detect_pen_marks(aligned, diff, params)
     wrinkle_score, wrinkle_map    = detect_wrinkles(master_gray, aligned, params)
+    bad_zones,    zone_heatmap, _ = detect_zone_missing(master_gray, aligned)
 
     return (ssim_score, diff_area_pct, diff, diff_mask,
-            pen_pixels, pen_overlay, wrinkle_score, wrinkle_map)
+            pen_pixels, pen_overlay, wrinkle_score, wrinkle_map,
+            bad_zones, zone_heatmap)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -462,7 +531,8 @@ def draw_live(frame, region, tracker_state, last_verdict, master_loaded):
 def draw_result_panel(master_gray, aligned, diff_mask,
                       ssim_score, diff_pct, inliers,
                       pen_pixels, pen_overlay, wrinkle_score, wrinkle_map,
-                      verdict, ssim_ok, diff_ok, pen_ok, wrinkle_ok,
+                      bad_zones, zone_heatmap,
+                      verdict, ssim_ok, diff_ok, pen_ok, wrinkle_ok, zone_ok,
                       ssim_thresh, diff_thresh, pen_fail, wrinkle_fail):
     color = (0, 220, 0) if verdict == "GOOD" else (0, 0, 220)
     h = master_gray.shape[0]
@@ -478,9 +548,8 @@ def draw_result_panel(master_gray, aligned, diff_mask,
     # p3: SSIM diff overlay (blue) + pen marks (magenta)
     p3 = cv2.cvtColor(aligned, cv2.COLOR_GRAY2BGR)
     p3[diff_mask] = (0, 0, 220)
-    # overlay pen strokes in magenta on top
     pen_bin = cv2.cvtColor(pen_overlay, cv2.COLOR_BGR2GRAY)
-    pen_bin = (pen_bin == 0) & (pen_overlay[:, :, 0] == 255)  # magenta pixels
+    pen_bin = (pen_bin == 0) & (pen_overlay[:, :, 0] == 255)
     p3[pen_bin] = (255, 0, 255)
     diff_label = f"DIFF {diff_pct:.1f}%"
     if ENABLE_PEN_CHECK:
@@ -488,14 +557,8 @@ def draw_result_panel(master_gray, aligned, diff_mask,
     cv2.putText(p3, diff_label, (10, h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 220), 2)
 
-    # p4: wrinkle heatmap
-    p4 = wrinkle_map.copy()
-    wrinkle_label = f"WRINKLE {wrinkle_score:.2f}"
-    if not ENABLE_WRINKLE_CHECK:
-        wrinkle_label += "  (disabled)"
-    cv2.putText(p4, wrinkle_label, (10, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (0, 255, 0) if wrinkle_ok else (0, 0, 255), 2)
+    # p4: zone missing-content heatmap (red = missing, blue = ok)
+    p4 = zone_heatmap.copy()
 
     ph = 280
     def rs(img):
@@ -517,29 +580,28 @@ def draw_result_panel(master_gray, aligned, diff_mask,
                 cv2.FONT_HERSHEY_SIMPLEX, 3.5, color, 6, cv2.LINE_AA)
 
     # ── Metrics bar ───────────────────────────────────────────────────────────
-    sc  = (0, 220, 0) if ssim_ok    else (0, 0, 220)
-    dc  = (0, 220, 0) if diff_ok    else (0, 0, 220)
-    pc  = (0, 220, 0) if pen_ok     else (255, 0, 255)
-    wc  = (0, 220, 0) if wrinkle_ok else (0, 180, 255)
+    sc  = (0, 220, 0) if ssim_ok  else (0, 0, 220)
+    dc  = (0, 220, 0) if diff_ok  else (0, 0, 220)
+    zc  = (0, 220, 0) if zone_ok  else (0, 80, 255)
     dim = (120, 120, 120)
 
     bar = np.full((70, W, 3), 25, dtype=np.uint8)
-    # cv2.putText(bar, f"Inliers: {inliers}",
-    #             (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
     cv2.putText(bar, f"SSIM: {ssim_score:.3f}",
                 (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.7, sc, 2)
     cv2.putText(bar, f"Diff: {diff_pct:.1f}%",
                 (240, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.7, dc, 2)
-    # cv2.putText(bar, f"Pen: {pen_pixels}" + (" [OFF]" if not ENABLE_PEN_CHECK else ""),
-    #             (440, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-    #             dim if not ENABLE_PEN_CHECK else pc, 2)
-    # cv2.putText(bar, f"Wrinkle: {wrinkle_score:.2f}" + (" [OFF]" if not ENABLE_WRINKLE_CHECK else ""),
-    #             (640, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-    #             dim if not ENABLE_WRINKLE_CHECK else wc, 2)
+    zone_label = f"Zones: {bad_zones}/{ZONE_COLS * ZONE_ROWS}"
+    if not ENABLE_ZONE_CHECK:
+        zone_label += " [OFF]"
+    cv2.putText(bar, zone_label,
+                (430, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                dim if not ENABLE_ZONE_CHECK else zc, 2)
 
     reason = []
     if not ssim_ok: reason.append(f"SSIM {ssim_score:.3f}<{ssim_thresh}")
     if not diff_ok: reason.append(f"diff {diff_pct:.1f}%>={diff_thresh}%")
+    if ENABLE_ZONE_CHECK and not zone_ok:
+        reason.append(f"missing content {bad_zones} zones>={ZONE_FAIL_COUNT}")
     if ENABLE_PEN_CHECK     and not pen_ok:     reason.append(f"pen {pen_pixels}>={pen_fail}")
     if ENABLE_WRINKLE_CHECK and not wrinkle_ok: reason.append(f"wrinkle {wrinkle_score:.2f}>={wrinkle_fail}")
     if reason:
@@ -574,7 +636,8 @@ def run_check(frame, region, master_gray, sift, ssim_thresh, diff_thresh,
 
     (ssim_score, diff_pct, _, diff_mask,
      pen_pixels, pen_overlay,
-     wrinkle_score, wrinkle_map) = compute_scores(master_gray, aligned, params)
+     wrinkle_score, wrinkle_map,
+     bad_zones, zone_heatmap) = compute_scores(master_gray, aligned, params)
 
     pen_fail     = params["pen_fail_count"] if params else PEN_FAIL_COUNT
     wrinkle_fail = params["wrinkle_fail"] if params else WRINKLE_FAIL
@@ -583,17 +646,20 @@ def run_check(frame, region, master_gray, sift, ssim_thresh, diff_thresh,
     diff_ok    = diff_pct     <  diff_thresh
     pen_ok     = (pen_pixels < pen_fail) if ENABLE_PEN_CHECK     else True
     wrinkle_ok = (wrinkle_score < wrinkle_fail) if ENABLE_WRINKLE_CHECK else True
-    verdict    = "GOOD" if (ssim_ok and diff_ok and pen_ok and wrinkle_ok) else "BAD"
+    zone_ok    = (bad_zones < ZONE_FAIL_COUNT) if ENABLE_ZONE_CHECK     else True
+    verdict    = "GOOD" if (ssim_ok and diff_ok and pen_ok and wrinkle_ok and zone_ok) else "BAD"
 
     fname = save_result(crop, verdict)
     print(f"  {tag}[{verdict}]  SSIM={ssim_score:.3f}  Diff={diff_pct:.1f}%  "
-          f"Pen={pen_pixels} blob(s)  Wrinkle={wrinkle_score:.2f}  Inliers={inliers}  → {fname}")
+          f"Zones={bad_zones}/{ZONE_COLS*ZONE_ROWS}  Pen={pen_pixels}  "
+          f"Wrinkle={wrinkle_score:.2f}  Inliers={inliers}  → {fname}")
 
     panel = draw_result_panel(
         master_gray, aligned, diff_mask,
         ssim_score, diff_pct, inliers,
         pen_pixels, pen_overlay, wrinkle_score, wrinkle_map,
-        verdict, ssim_ok, diff_ok, pen_ok, wrinkle_ok,
+        bad_zones, zone_heatmap,
+        verdict, ssim_ok, diff_ok, pen_ok, wrinkle_ok, zone_ok,
         ssim_thresh, diff_thresh, pen_fail, wrinkle_fail)
 
     return verdict, panel, crop
