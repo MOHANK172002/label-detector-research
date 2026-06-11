@@ -83,7 +83,7 @@ ZONE_COLS        = 40     # grid columns
 ZONE_ROWS        = 40    # grid rows
 ZONE_SSIM_THR    = 0.60  # per-zone SSIM below this = content missing in zone
 ZONE_FAIL_COUNT  = 1    # how many bad zones before verdict = BAD
-ZONE_EDGE_PCT    = 0.0  # fraction of label width/height to ignore at each edge
+ZONE_EDGE_PCT    = 0.005  # fraction of label width/height to ignore at each edge
 
 # ── Label detector (from crop_tool.py) ────────────────────────────────────────
 AD_S_MAX        = 255   # max saturation to be considered a label pixel
@@ -148,16 +148,21 @@ def read_tuner():
 
 def detect_label(frame, params=None):
     """
-    Detect the label rectangle in a bottom-lit cyan scene.
-    params: dict from read_tuner(), or None to use module-level defaults.
-    Returns {x, y, w, h} of the blob closest to the frame centre, or None.
-    Also returns the binary mask (for tuner preview).
+    Detect the label rectangle using HSV sat-suppress, then fit a minAreaRect
+    to get the oriented bounding box.  Returns a region dict with both the
+    axis-aligned bbox (for drawing) and the 4-corner oriented quad (for
+    perspective crop), plus the binary mask.
+
+    region keys:
+      x, y, w, h   – axis-aligned bbox (for drawing the live overlay)
+      quad          – np.float32 shape (4,2) ordered TL,TR,BR,BL (for warp)
+      quad_w, quad_h – canonical output size for the warp
     """
-    s_max    = params["s_max"]    if params else AD_S_MAX
-    v_min    = params["v_min"]    if params else AD_V_MIN
-    morph_k  = params["morph_k"]  if params else AD_MORPH_K
+    s_max        = params["s_max"]    if params else AD_S_MAX
+    v_min        = params["v_min"]    if params else AD_V_MIN
+    morph_k      = params["morph_k"]  if params else AD_MORPH_K
     min_area_pct = params["min_area"] if params else AD_MIN_AREA_PCT
-    padding  = params["padding"]  if params else AD_PADDING
+    padding      = params["padding"]  if params else AD_PADDING
 
     fh, fw = frame.shape[:2]
     hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -181,10 +186,10 @@ def detect_label(frame, params=None):
 
     cnts, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    min_area = (min_area_pct / 100.0) * fh * fw
+    min_area   = (min_area_pct / 100.0) * fh * fw
     cx_f, cy_f = fw // 2, fh // 2
-    best_box  = None
-    best_dist = float("inf")
+    best_cnt   = None
+    best_dist  = float("inf")
 
     for cnt in cnts:
         if cv2.contourArea(cnt) < min_area:
@@ -197,17 +202,62 @@ def detect_label(frame, params=None):
         dist = ((x + w // 2 - cx_f) ** 2 + (y + h // 2 - cy_f) ** 2) ** 0.5
         if dist < best_dist:
             best_dist = dist
-            best_box  = (x, y, w, h)
+            best_cnt  = cnt
 
-    if best_box is None:
+    if best_cnt is None:
         return None, solid
 
-    x, y, w, h = best_box
-    x = max(0, x - padding)
-    y = max(0, y - padding)
-    w = min(fw - x, w + padding * 2)
-    h = min(fh - y, h + padding * 2)
-    return {"x": x, "y": y, "w": w, "h": h}, solid
+    # ── Oriented bounding box via minAreaRect ─────────────────────────────────
+    rect      = cv2.minAreaRect(best_cnt)   # (centre, (w,h), angle)
+    box_pts   = cv2.boxPoints(rect)         # 4 corners, float32
+    box_pts   = np.float32(box_pts)
+
+    # Order corners: top-left, top-right, bottom-right, bottom-left
+    # Sort by y to split top/bottom pair, then by x within each pair
+    s   = box_pts.sum(axis=1)       # smallest sum = TL, largest = BR
+    d   = np.diff(box_pts, axis=1)  # smallest diff = TR, largest = BL
+    tl  = box_pts[np.argmin(s)]
+    br  = box_pts[np.argmax(s)]
+    tr  = box_pts[np.argmin(d)]
+    bl  = box_pts[np.argmax(d)]
+    quad = np.float32([tl, tr, br, bl])
+
+    # Canonical output size = actual oriented rect dimensions (swap if angle rotated >45°)
+    rw, rh = rect[1]
+    if rw < rh:
+        rw, rh = rh, rw
+    quad_w = int(rw) + padding * 2
+    quad_h = int(rh) + padding * 2
+
+    # Axis-aligned bbox for live overlay rectangle
+    ax, ay, aw, ah = cv2.boundingRect(box_pts.astype(np.int32))
+
+    return {
+        "x": ax, "y": ay, "w": aw, "h": ah,
+        "quad": quad, "quad_w": quad_w, "quad_h": quad_h
+    }, solid
+
+
+def crop_oriented(frame, region):
+    """
+    Perspective-warp the oriented label quad to a clean upright rectangle.
+    No background wedges at corners, no white bleed from axis-aligned edges.
+    """
+    quad   = region["quad"]
+    out_w  = region["quad_w"]
+    out_h  = region["quad_h"]
+
+    dst = np.float32([
+        [0,         0        ],
+        [out_w - 1, 0        ],
+        [out_w - 1, out_h - 1],
+        [0,         out_h - 1],
+    ])
+    M    = cv2.getPerspectiveTransform(quad, dst)
+    warp = cv2.warpPerspective(frame, M, (out_w, out_h),
+                               flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REPLICATE)
+    return warp
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -500,10 +550,16 @@ def draw_live(frame, region, tracker_state, last_verdict, master_loaded):
     fh, fw = frame.shape[:2]
 
     if region is not None:
-        rx, ry, rw, rh = region["x"], region["y"], region["w"], region["h"]
         color = TRACKER_COLOR.get(tracker_state, (0, 255, 0))
-        cv2.rectangle(out, (rx, ry), (rx + rw, ry + rh), color, 2)
-        cv2.putText(out, f"LABEL  {tracker_state}  {rw}x{rh}px",
+        if "quad" in region:
+            pts = region["quad"].astype(np.int32).reshape((-1, 1, 2))
+            cv2.polylines(out, [pts], isClosed=True, color=color, thickness=2)
+            rx, ry = int(region["quad"][:, 0].min()), int(region["quad"][:, 1].min())
+        else:
+            rx, ry, rw, rh = region["x"], region["y"], region["w"], region["h"]
+            cv2.rectangle(out, (rx, ry), (rx + rw, ry + rh), color, 2)
+        qw, qh = region.get("quad_w", region["w"]), region.get("quad_h", region["h"])
+        cv2.putText(out, f"LABEL  {tracker_state}  {qw}x{qh}px",
                     (rx, max(ry - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
     else:
         cv2.putText(out, "No label detected",
@@ -560,13 +616,22 @@ def draw_result_panel(master_gray, aligned, diff_mask,
     # p4: zone missing-content heatmap (red = missing, blue = ok)
     p4 = zone_heatmap.copy()
 
-    ph = 280
+    ph  = 280
+    GAP = 6   # black gap between panels in pixels
+
     def rs(img):
         s = ph / img.shape[0]
         return cv2.resize(img, (int(img.shape[1] * s), ph))
 
-    grid = np.vstack([np.hstack([rs(p1), rs(p2)]),
-                      np.hstack([rs(p3), rs(p4)])])
+    r1, r2, r3, r4 = rs(p1), rs(p2), rs(p3), rs(p4)
+    pw = r1.shape[1]
+
+    sep_v = np.zeros((ph,  GAP, 3), dtype=np.uint8)   # vertical divider
+    sep_h = np.zeros((GAP, pw * 2 + GAP, 3), dtype=np.uint8)  # horizontal divider
+
+    top_row = np.hstack([r1, sep_v, r2])
+    bot_row = np.hstack([r3, sep_v, r4])
+    grid    = np.vstack([top_row, sep_h, bot_row])
 
     W = grid.shape[1]
 
@@ -616,6 +681,12 @@ def draw_result_panel(master_gray, aligned, diff_mask,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def crop_region(frame, region):
+    """
+    Use the oriented perspective warp when quad is available (new path),
+    fall back to simple axis-aligned slice otherwise.
+    """
+    if "quad" in region:
+        return crop_oriented(frame, region)
     rx, ry, rw, rh = region["x"], region["y"], region["w"], region["h"]
     x1 = max(0, rx)
     y1 = max(0, ry)
@@ -732,8 +803,12 @@ def main():
         if tuner_open:
             mask_disp = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
             if region is not None:
-                rx, ry, rw, rh = region["x"], region["y"], region["w"], region["h"]
-                cv2.rectangle(mask_disp, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
+                if "quad" in region:
+                    pts = region["quad"].astype(np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(mask_disp, [pts], True, (0, 255, 0), 2)
+                else:
+                    rx, ry, rw, rh = region["x"], region["y"], region["w"], region["h"]
+                    cv2.rectangle(mask_disp, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
             cv2.imshow(WIN_TUNER, mask_disp)
 
         # ── Tracker update ────────────────────────────────────────────
