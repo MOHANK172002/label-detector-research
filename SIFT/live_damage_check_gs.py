@@ -51,7 +51,7 @@ else:
 
 # ── Stream (GStreamer v4l2src — see gstream.py) ────────────────────────────────
 DEFAULT_CAM_INDEX = 2
-DEFAULT_WIDTH     = 1600
+DEFAULT_WIDTH     = 1920
 DEFAULT_HEIGHT    = 1200
 DEFAULT_FPS       = 30
 DEFAULT_FORMAT    = "MJPG"
@@ -120,8 +120,9 @@ RATIO_TEST     = 0.75
 MIN_INLIERS    = 40
 
 # ── Tracker ────────────────────────────────────────────────────────────────────
-CHECK_COOLDOWN = 0.3        # seconds between auto-checks
-AUTO_CHECK     = True
+CHECK_COOLDOWN  = 0.3        # seconds between auto-checks
+AUTO_CHECK      = True
+TRACKER_STABLE_DIFF = 6.0    # max frame-to-frame crop-mean change still considered "stable"
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 ENABLE_PEN_CHECK     = False   # set True to enable pen/marker detection
@@ -145,11 +146,11 @@ ZONE_COLS        = 40     # grid columns
 ZONE_ROWS        = 40    # grid rows
 ZONE_SSIM_THR    = 0.60  # per-zone SSIM below this = content missing in zone
 ZONE_FAIL_COUNT  = 1    # how many bad zones before verdict = BAD
-ZONE_EDGE_PCT    = 0.005  # fraction of label width/height to ignore at each edge
+ZONE_EDGE_PCT    = 0.05  # fraction of label width/height to ignore at each edge
 
 # ── Label detector (from crop_tool.py) ────────────────────────────────────────
 AD_S_MAX        = 255   # max saturation to be considered a label pixel
-AD_V_MIN        = 174   # min brightness to be considered a label pixel
+AD_V_MIN        = 218   # min brightness to be considered a label pixel
 AD_MORPH_K      = 7     # morphology kernel size (odd)
 AD_MIN_AREA_PCT = 4     # % of frame area — smaller blobs ignored
 AD_PADDING      = 0    # pixels of padding added around detected bbox
@@ -347,7 +348,7 @@ class LabelTracker:
         diff = abs(mean - self.last_mean)
         self.last_mean = mean
 
-        if diff > 2.0:
+        if diff > TRACKER_STABLE_DIFF:
             self.stable_since = now
             self.state        = "WAITING"
             return False
@@ -895,6 +896,7 @@ def main():
 
     while True:
         ret, frame = cap.read()
+        # print(f"Frame shape: {frame.shape}")  # Debug: print frame shape
         if not ret:
             time.sleep(0.05)
             continue
